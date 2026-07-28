@@ -18,3 +18,5 @@
 !*.jpeg
 !*.svg
 !*.webp
+__pycache__/
+*.py[cod]
