@@ -103,12 +103,24 @@ def _render_progress(
     stage_total,
     message,
     started_at,
+    completed=None,
+    total=None,
+    current=None,
 ):
     elapsed = time.perf_counter() - started_at
+    parts = [
+        f"[因子基础指标] [{stage_number}/{stage_total}] {message}"
+    ]
+    if completed is not None and total:
+        parts.append(f"{completed}/{total} ({completed / total:.1%})")
+        if 0 < completed < total:
+            remaining = elapsed / completed * (total - completed)
+            parts.append(f"预计剩余 {remaining:.1f}s")
+    if current is not None:
+        parts.append(f"当前 {current}")
+    parts.append(f"已耗时 {elapsed:.1f}s")
     print(
-        "\r"
-        f"[因子基础指标] [{stage_number}/{stage_total}] "
-        f"{message} | 已耗时 {elapsed:.1f}s",
+        "\r" + " | ".join(parts).ljust(200),
         end="",
         flush=True,
     )
@@ -533,14 +545,13 @@ def _calculate_metrics_from_panels(
         )
         if show_progress and should_refresh:
             _render_progress(
-                5,
-                6,
-                (
-                    f"计算截面 {position}/{total_periods}"
-                    f"（{position / total_periods:.1%}），"
-                    f"当前 {signal_date:%Y-%m-%d}"
-                ),
+                7,
+                8,
+                "逐截面计算IC、RankIC与因子收益",
                 started_at,
+                completed=position,
+                total=total_periods,
+                current=f"{signal_date:%Y-%m-%d}，样本{sample_count:,}只",
             )
 
     timeseries = pd.DataFrame(
@@ -746,7 +757,7 @@ def calculate_factor_basic_metrics(
         if show_progress:
             _render_progress(
                 1,
-                6,
+                8,
                 "解析因子元数据和动态预热窗口",
                 started_at,
             )
@@ -774,7 +785,7 @@ def calculate_factor_basic_metrics(
         if show_progress:
             _render_progress(
                 2,
-                6,
+                8,
                 "读取交易日历并生成评价截面",
                 started_at,
             )
@@ -796,7 +807,7 @@ def calculate_factor_basic_metrics(
         if show_progress:
             _render_progress(
                 3,
-                6,
+                8,
                 (
                     f"适配器读取因子数据："
                     f"{len(factor_dates)} 个日期"
@@ -811,6 +822,20 @@ def calculate_factor_basic_metrics(
             instruments=instruments,
             show_progress=False,
         )
+        if show_progress:
+            row_summary = ", ".join(
+                f"{name}:{count:,}行"
+                for name, count in factor_raw_data.row_counts().items()
+            )
+            _render_progress(
+                4,
+                8,
+                "调用因子函数计算目标截面",
+                started_at,
+                completed=0,
+                total=len(target_dates),
+                current=f"{factor_name}；{row_summary}",
+            )
         factor_data = get_factor(
             factor_name,
             factor_raw_data,
@@ -820,11 +845,21 @@ def calculate_factor_basic_metrics(
             show_progress=False,
             progress_every=progress_every,
         )
-
         if show_progress:
             _render_progress(
                 4,
-                6,
+                8,
+                "因子目标截面计算完成",
+                started_at,
+                completed=len(target_dates),
+                total=len(target_dates),
+                current=f"{len(factor_data):,}条因子记录",
+            )
+
+        if show_progress:
+            _render_progress(
+                5,
+                8,
                 "适配器读取价格并构造完整未来收益标签",
                 started_at,
             )
@@ -833,6 +868,14 @@ def calculate_factor_basic_metrics(
             schedule,
             instruments,
         )
+        if show_progress:
+            _render_progress(
+                6,
+                8,
+                "对齐因子结果和未来收益标签",
+                started_at,
+                current=f"{len(label_data):,}条完整标签",
+            )
         summary, timeseries = _calculate_metrics_from_panels(
             factor_data=factor_data,
             label_data=label_data,
@@ -848,8 +891,8 @@ def calculate_factor_basic_metrics(
         if plot:
             if show_progress:
                 _render_progress(
-                    6,
-                    6,
+                    8,
+                    8,
                     "绘制并展示IC/RankIC时序图",
                     started_at,
                 )
@@ -869,8 +912,8 @@ def calculate_factor_basic_metrics(
             )
         elif show_progress:
             _render_progress(
-                6,
-                6,
+                8,
+                8,
                 "计算完成，已按参数跳过绘图",
                 started_at,
             )

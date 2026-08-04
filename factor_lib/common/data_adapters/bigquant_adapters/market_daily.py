@@ -276,6 +276,15 @@ def _to_dataframe(query_result):
     )
 
 
+def _render_progress(stage, started_at, detail=""):
+    elapsed = time.perf_counter() - started_at
+    message = f"\r[BigQuant 市场日频适配器] {stage}"
+    if detail:
+        message += f" | {detail}"
+    message += f" | 已耗时 {elapsed:.1f}s"
+    print(message.ljust(180), end="", flush=True)
+
+
 def load_market_daily_raw_data(
     standard_fields,
     market_index,
@@ -306,10 +315,13 @@ def load_market_daily_raw_data(
     started_at = time.perf_counter()
 
     if show_progress:
-        print(
-            "\r[BigQuant 市场日频适配器] 开始拉取原始数据...",
-            end="",
-            flush=True,
+        _render_progress(
+            "[1/3] 提交市场指数查询",
+            started_at,
+            detail=(
+                f"指数 {','.join(market_indices)}，"
+                f"{len(fields)} 个字段"
+            ),
         )
 
     try:
@@ -317,6 +329,12 @@ def load_market_daily_raw_data(
             query_result = _default_query(sql, filters)
         else:
             query_result = _call_query_func(query_func, sql, filters)
+        if show_progress:
+            _render_progress(
+                "[2/3] 转换并校验查询结果",
+                started_at,
+                detail=f"指数 {','.join(market_indices)}",
+            )
         result = _to_dataframe(query_result).copy()
 
         expected_source_columns = {
@@ -368,15 +386,18 @@ def load_market_daily_raw_data(
                 f"{examples}"
             )
 
-        return (
+        result = (
             result[["date", "market_index", *fields]]
             .sort_values(["date", "market_index"], kind="mergesort")
             .reset_index(drop=True)
         )
+        if show_progress:
+            _render_progress(
+                "[3/3] 市场日频数据准备完成",
+                started_at,
+                detail=f"{len(result):,} 行",
+            )
+        return result
     finally:
         if show_progress:
-            elapsed = time.perf_counter() - started_at
-            print(
-                "\r[BigQuant 市场日频适配器] "
-                f"完成，耗时 {elapsed:.1f}s。"
-            )
+            print()

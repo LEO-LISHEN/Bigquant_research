@@ -439,7 +439,14 @@ def _merge_same_granularity_panels(panels, key_columns, output_group):
     ).reset_index(drop=True)
 
 
-def _render_loader_progress(completed, total, adapter_name, started_at):
+def _render_loader_progress(
+    completed,
+    total,
+    adapter_name,
+    started_at,
+    stage=None,
+    detail="",
+):
     elapsed = time.perf_counter() - started_at
     percentage = 100.0 if total == 0 else completed / total * 100.0
     if 0 < completed < total:
@@ -447,14 +454,19 @@ def _render_loader_progress(completed, total, adapter_name, started_at):
         eta = f"，预计剩余 {remaining:.1f}s"
     else:
         eta = ""
-    stage = "准备加载" if completed == 0 else f"已完成 {adapter_name}"
-    print(
+    if stage is None:
+        stage = "准备加载" if completed == 0 else f"已完成 {adapter_name}"
+    message = (
         "\r[BigQuant loader] "
         f"{completed}/{total}（{percentage:6.2f}%），"
-        f"{stage}，耗时 {elapsed:.1f}s{eta}",
-        end="",
-        flush=True,
+        f"{stage}"
     )
+    if adapter_name:
+        message += f"，当前 {adapter_name}"
+    if detail:
+        message += f"，{detail}"
+    message += f"，耗时 {elapsed:.1f}s{eta}"
+    print(message.ljust(180), end="", flush=True)
 
 
 def load_factor_raw_data(
@@ -498,6 +510,16 @@ def load_factor_raw_data(
             adapter = item["loader"]
             spec = item["spec"]
 
+            if show_progress:
+                _render_loader_progress(
+                    index - 1,
+                    len(items),
+                    adapter_name,
+                    started_at,
+                    stage="正在调用数据适配器",
+                    detail=f"{len(fields)} 个标准字段",
+                )
+
             call_kwargs = {
                 "standard_fields": fields,
                 "start_date": start_date,
@@ -535,17 +557,43 @@ def load_factor_raw_data(
 
             if show_progress:
                 _render_loader_progress(
-                    index, len(items), adapter_name, started_at
+                    index,
+                    len(items),
+                    adapter_name,
+                    started_at,
+                    stage="适配器数据加载完成",
+                    detail=f"{len(panel):,} 行 -> {output_group}",
                 )
 
-        domains = {
-            output_group: _merge_same_granularity_panels(
+        group_items = list(grouped_panels.items())
+        domains = {}
+        for index, (output_group, panels) in enumerate(
+            group_items,
+            start=1,
+        ):
+            if show_progress:
+                _render_loader_progress(
+                    index - 1,
+                    len(group_items),
+                    output_group,
+                    started_at,
+                    stage="正在合并同粒度数据域",
+                    detail=f"{len(panels)} 个面板",
+                )
+            domains[output_group] = _merge_same_granularity_panels(
                 panels,
                 group_keys[output_group],
                 output_group,
             )
-            for output_group, panels in grouped_panels.items()
-        }
+            if show_progress:
+                _render_loader_progress(
+                    index,
+                    len(group_items),
+                    output_group,
+                    started_at,
+                    stage="数据域合并完成",
+                    detail=f"{len(domains[output_group]):,} 行",
+                )
         return FactorDataBundle(domains, key_columns=group_keys)
     finally:
         if show_progress:

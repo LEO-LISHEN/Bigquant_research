@@ -28,9 +28,11 @@ factor_lib/
 ├── Factor Repository/
 ├── common/
 │   ├── preprocess/
-│   ├── data_adapters/
-│   ├── factor_evaluation/
-│   └── strategies/
+│   └── data_adapters/
+├── function/
+│   └── bigquant_function/
+│       ├── factor_evaluation/
+│       └── strategies/
 └── factor_hub/
 ```
 
@@ -39,11 +41,13 @@ factor_lib/
 | `Factor Repository/` | 存放参数化因子脚本以及模块内的 `FACTOR` 元数据。 |
 | `common/preprocess/` | 存放不读取数据源的通用去极值、标准化和中性化函数。 |
 | `common/data_adapters/` | 存放不同平台的数据映射、适配器、loader 和分粒度数据容器。 |
-| `common/factor_evaluation/` | 当前存放自动取数、计算因子、构造标签、计算指标和绘图的评价入口。 |
-| `common/strategies/` | 当前存放依赖 BigTrader 执行的策略回测入口。 |
+| `function/bigquant_function/factor_evaluation/` | 存放依赖 BigQuant 取数环境的自动因子评价与绘图入口。 |
+| `function/bigquant_function/strategies/` | 存放依赖 BigQuant 数据适配器和 BigTrader 的策略回测入口。 |
 | `factor_hub/` | 动态发现、列表、搜索、说明和调用因子。 |
 
-`factor_evaluation` 和 `strategies` 当前确实包含 BigQuant 平台编排代码。以后如调整目录，可以把平台运行器移到单独的平台目录，但不应仅为了追求形式上的“common”而阻碍当前可用性。
+`function/bigquant_function/` 是已经落地的平台函数层。评价和策略编排因为需要调用 BigQuant 数据适配器、交易日历或 BigTrader，统一放在该目录；不要再从旧的 `factor_lib.common.factor_evaluation` 或 `factor_lib.common.strategies` 路径导入。
+
+`common/` 保存跨组件复用的基础设施。其中 `preprocess` 保持数据源无关；`data_adapters` 通过平台子目录隔离具体数据源映射。目录名为 `common` 不代表其下所有适配器都能脱离平台运行。
 
 ## 3. 总体调用链
 
@@ -441,6 +445,10 @@ get_factor(name, data, **params)
 公开基础评价入口接收：
 
 ```python
+from factor_lib.function.bigquant_function.factor_evaluation.calculate_factor_basic_metrics import (
+    calculate_factor_basic_metrics,
+)
+
 calculate_factor_basic_metrics(
     start_date,
     end_date,
@@ -471,6 +479,10 @@ calculate_factor_basic_metrics(
 相关性入口为：
 
 ```python
+from factor_lib.function.bigquant_function.factor_evaluation.calculate_factor_correlation import (
+    calculate_factor_correlation,
+)
+
 calculate_factor_correlation(
     start_date,
     end_date,
@@ -498,6 +510,10 @@ calculate_factor_correlation(
 公开入口：
 
 ```python
+from factor_lib.function.bigquant_function.strategies.market_cap_group_backtest import (
+    run_market_cap_group_backtest,
+)
+
 run_market_cap_group_backtest(
     start_date,
     end_date,

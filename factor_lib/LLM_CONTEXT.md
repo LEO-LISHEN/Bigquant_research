@@ -158,7 +158,24 @@ loader 不应根据调仓规则自行推断信号日，也不应决定策略何�
 
 当前评价和策略编排代码会调用 BigQuant 数据适配器，市值分组策略还会调用 BigTrader 原生回测引擎。这属于平台执行层的必要依赖，不应在没有用户要求的情况下当作缺陷删除。
 
-用户未来可能调整这些脚本的目录层级，但目录移动与逻辑重写是两件事。不要擅自进行大范围迁移。
+这些平台函数已经从 `common` 迁移到：
+
+```text
+factor_lib/function/bigquant_function/
+├── factor_evaluation/
+└── strategies/
+```
+
+正确导入前缀是：
+
+```python
+factor_lib.function.bigquant_function.factor_evaluation
+factor_lib.function.bigquant_function.strategies
+```
+
+旧的 `factor_lib.common.factor_evaluation` 和 `factor_lib.common.strategies` 路径已经失效。修改测试 notebook、示例或其他调用方时，必须同步更新导入路径。
+
+`common/preprocess` 继续保存数据源无关的公共预处理；`common/data_adapters` 保存加载基础设施，并通过平台子目录隔离具体适配器。不要仅因目录名为 `common` 就误判 BigQuant 适配器也应脱离平台。
 
 ### 3.10 因子方向不自动控制策略
 
@@ -537,7 +554,7 @@ BigQuant notebook 会缓存已导入模块和变量。修改 `.py` 后，仅重�
 6. 市场指数由统一语义名称映射到不同平台代码；
 7. 因子计算可以通过 `domain_data` 读取共享市场域；
 8. 评价和策略公开入口接收因子名称，而非预计算因子表；
-9. 当前评价和策略编排依赖 BigQuant 适配器属于正常设计；
+9. BigQuant 评价和策略入口位于 `function/bigquant_function`，其平台依赖属于正常设计；
 10. 市值分组策略不自动使用因子方向；
 11. 分位区间始终表示原始因子值从小到大的百分位；
 12. BigTrader 回测关闭缓存；

@@ -53,6 +53,12 @@ FINANCIAL_TABLE_CONFIG = {
 # 2. 字段含义、MRQ/TTM/LF 口径正确；
 # 3. 来源表已经是按交易日组织的点时面板。
 FINANCIAL_FIELD_MAPPING = {
+    # ===== 盈利质量：净资产收益率 =====
+    "quarterly_average_roe": {
+        "table": "cn_stock_factors_financial_indicators",
+        "column": "roe_avg_mrq",
+        "description": "净资产收益率（平均，单季度）",
+    },
     # ===== 成长：净利润 =====
     "quarterly_net_profit_yoy": {
         "table": "cn_stock_factors_financial_indicators",
@@ -604,6 +610,8 @@ def _render_progress(
     table,
     started_at,
     finished=False,
+    stage=None,
+    detail="",
 ):
     elapsed = time.perf_counter() - started_at
     percentage = 100.0 if total == 0 else completed / total * 100.0
@@ -614,19 +622,23 @@ def _render_progress(
     else:
         eta_text = ""
 
-    if finished:
-        stage = "完成"
-    elif completed == 0:
-        stage = "准备查询"
-    else:
-        stage = f"已完成 {table}"
+    if stage is None:
+        if finished:
+            stage = "完成"
+        elif completed == 0:
+            stage = "准备查询"
+        else:
+            stage = f"已完成 {table}"
 
     message = (
         "\r[BigQuant 财务适配器] "
         f"{completed}/{total}（{percentage:6.2f}%）"
-        f"，{stage}，耗时 {elapsed:.1f}s{eta_text}"
+        f"，{stage}"
     )
-    print(message, end="", flush=True)
+    if detail:
+        message += f"，{detail}"
+    message += f"，耗时 {elapsed:.1f}s{eta_text}"
+    print(message.ljust(180), end="", flush=True)
 
 
 def load_financial_raw_data(
@@ -679,6 +691,15 @@ def load_financial_raw_data(
             table_items,
             start=1,
         ):
+            if show_progress:
+                _render_progress(
+                    completed=index - 1,
+                    total=total_tables,
+                    table=table,
+                    started_at=started_at,
+                    stage="正在查询来源表",
+                    detail=f"{len(table_fields)} 个字段",
+                )
             sql = _build_table_sql(
                 table=table,
                 fields=table_fields,
@@ -712,8 +733,18 @@ def load_financial_raw_data(
                     table=table,
                     started_at=started_at,
                     finished=index == total_tables,
+                    detail=f"返回 {len(panel):,} 行",
                 )
 
+        if show_progress:
+            _render_progress(
+                completed=total_tables,
+                total=total_tables,
+                table="",
+                started_at=started_at,
+                stage="正在合并财务来源表",
+                detail=f"{total_tables} 张表",
+            )
         result = _merge_table_panels(panels)
         expected_columns = ["date", "instrument", *fields]
         result = (
@@ -724,6 +755,15 @@ def load_financial_raw_data(
             )
             .reset_index(drop=True)
         )
+        if show_progress:
+            _render_progress(
+                completed=total_tables,
+                total=total_tables,
+                table="",
+                started_at=started_at,
+                finished=True,
+                detail=f"合并后 {len(result):,} 行",
+            )
         return result
     finally:
         if show_progress:

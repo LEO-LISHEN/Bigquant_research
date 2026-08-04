@@ -85,6 +85,15 @@ DAILY_FIELD_MAPPING = {
         "table": "valuation",
         "column": "dividend_yield_ratio",
     },
+    # cn_stock_moneyflow：日频个股资金流原始字段
+    "main_inflow_amount": {
+        "table": "moneyflow",
+        "column": "inflow_amount_main",
+    },
+    "main_outflow_amount": {
+        "table": "moneyflow",
+        "column": "outflow_amount_main",
+    },
     # cn_stock_prefactors：日频证券属性 / 行业 /状态字段
     "industry": {"table": "prefactors", "column": "cs_level1"},
     "industry_level1": {
@@ -151,6 +160,11 @@ TABLE_SPECS = {
         "name": "cn_stock_prefactors",
         "alias": "p",
         "base_priority": 10,
+    },
+    "moneyflow": {
+        "name": "cn_stock_moneyflow",
+        "alias": "mf",
+        "base_priority": 5,
     },
 }
 
@@ -407,6 +421,21 @@ def _default_query(sql, filters):
     return dai.query(sql, filters=filters)
 
 
+def _render_progress(stage, started_at, completed=None, total=None, detail=""):
+    elapsed = time.perf_counter() - started_at
+    parts = [f"[BigQuant 日频适配器] {stage}"]
+    if completed is not None and total:
+        percentage = completed / total
+        parts.append(f"{completed}/{total} ({percentage:.1%})")
+        if 0 < completed < total:
+            remaining = elapsed / completed * (total - completed)
+            parts.append(f"预计剩余 {remaining:.1f}s")
+    if detail:
+        parts.append(str(detail))
+    parts.append(f"已耗时 {elapsed:.1f}s")
+    print("\r" + " | ".join(parts).ljust(180), end="", flush=True)
+
+
 def load_daily_raw_data(
     standard_fields,
     start_date=None,
@@ -460,22 +489,22 @@ def load_daily_raw_data(
     partition_filters = _build_partition_filters(date_selector)
     started_at = time.perf_counter()
 
+    if date_selector["mode"] == "range":
+        date_summary = (
+            f"{date_selector['start_date']} 至 "
+            f"{date_selector['end_date']}"
+        )
+    else:
+        date_summary = (
+            f"{len(date_selector['dates'])} 个离散日期"
+            f"（{date_selector['dates'][0]} 至 "
+            f"{date_selector['dates'][-1]}）"
+        )
     if show_progress:
-        if date_selector["mode"] == "range":
-            date_summary = (
-                f"{date_selector['start_date']} 至 "
-                f"{date_selector['end_date']}"
-            )
-        else:
-            date_summary = (
-                f"{len(date_selector['dates'])} 个离散日期"
-                f"（{date_selector['dates'][0]} 至 "
-                f"{date_selector['dates'][-1]}）"
-            )
-        print(
-            f"[BigQuant 日频适配器] 开始拉取 {date_summary} "
-            f"的 {len(fields)} 个字段...",
-            flush=True,
+        _render_progress(
+            "[1/3] 提交日频查询",
+            started_at,
+            detail=f"{date_summary}，{len(fields)} 个字段",
         )
 
     if query_func is None:
@@ -487,6 +516,12 @@ def load_daily_raw_data(
         # 自定义查询函数主要用于本地测试，保持原有单参数接口兼容。
         query_result = query_func(sql)
 
+    if show_progress:
+        _render_progress(
+            "[2/3] 将查询结果转换为 DataFrame",
+            started_at,
+            detail=date_summary,
+        )
     result = (
         query_result.df()
         if hasattr(query_result, "df")
@@ -512,11 +547,13 @@ def load_daily_raw_data(
     result = result.loc[:, expected_columns]
 
     if show_progress:
-        elapsed = time.perf_counter() - started_at
-        print(
-            f"[BigQuant 日频适配器] 拉取完成："
-            f"{len(result):,} 行，耗时 {elapsed:.1f}s。",
-            flush=True,
+        _render_progress(
+            "[3/3] 查询结果校验完成",
+            started_at,
+            completed=1,
+            total=1,
+            detail=f"{len(result):,} 行",
         )
+        print()
 
     return result

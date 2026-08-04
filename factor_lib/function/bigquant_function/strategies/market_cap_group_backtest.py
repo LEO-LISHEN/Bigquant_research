@@ -854,25 +854,30 @@ def _get_first_attribute(obj, names, default=None):
     return default
 
 
-def _progress_line(
-    completed,
-    total,
-    current_date,
+def _render_progress(
+    stage_number,
+    stage_total,
+    stage,
     started_at,
+    completed=None,
+    total=None,
+    current=None,
+    detail="",
 ):
     elapsed = time.perf_counter() - started_at
-    remaining = (
-        elapsed / completed * (total - completed)
-        if completed > 0
-        else np.nan
-    )
+    parts = [f"[市值分组回测] [{stage_number}/{stage_total}] {stage}"]
+    if completed is not None and total:
+        parts.append(f"{completed}/{total} ({completed / total:.1%})")
+        if 0 < completed < total:
+            remaining = elapsed / completed * (total - completed)
+            parts.append(f"预计剩余 {remaining:.1f}s")
+    if current is not None:
+        parts.append(f"当前 {current}")
+    if detail:
+        parts.append(str(detail))
+    parts.append(f"已耗时 {elapsed:.1f}s")
     print(
-        "\r"
-        f"[市值分组回测] 信号 {completed}/{total} "
-        f"| {completed / total:.1%} "
-        f"| 当前：{current_date:%Y-%m-%d} "
-        f"| 已耗时：{elapsed:.1f}s "
-        f"| 预计剩余：{remaining:.1f}s",
+        "\r" + " | ".join(parts).ljust(220),
         end="",
         flush=True,
     )
@@ -1028,7 +1033,13 @@ def run_market_cap_group_backtest(
     from factor_lib.factor_hub.get_factor import get_factor
 
     if show_progress:
-        print("[市值分组回测] [1/5] 读取交易日历并生成调仓计划...")
+        _render_progress(
+            1,
+            8,
+            "读取交易日历并生成调仓计划",
+            started_at,
+            current=f"{start_date:%Y-%m-%d} 至 {end_date:%Y-%m-%d}",
+        )
 
     trading_calendar = _query_trading_calendar(end_date)
     schedule = _build_schedule(
@@ -1039,6 +1050,16 @@ def run_market_cap_group_backtest(
     )
     signal_dates = pd.DatetimeIndex(schedule["signal_date"])
     execution_dates = pd.DatetimeIndex(schedule["execution_date"])
+    if show_progress:
+        _render_progress(
+            1,
+            8,
+            "调仓计划生成完成",
+            started_at,
+            completed=1,
+            total=1,
+            detail=f"{len(schedule)}个信号/执行日组合",
+        )
 
     metadata = get_factor_metadata(factor_name)
     requirements = get_factor_data_requirements(
@@ -1070,7 +1091,16 @@ def run_market_cap_group_backtest(
     )
 
     if show_progress:
-        print("[市值分组回测] [2/5] 预存因子、选股和执行约束数据...")
+        _render_progress(
+            2,
+            8,
+            "预存因子原始数据",
+            started_at,
+            completed=0,
+            total=1,
+            current=factor_name,
+            detail=f"{len(factor_dates)}个所需日期",
+        )
 
     factor_raw_bundle = load_factor_raw_data(
         factor_name=factor_name,
@@ -1089,6 +1119,17 @@ def run_market_cap_group_backtest(
         factor_raw_data,
         key_columns=("date", "instrument"),
     )
+    if show_progress:
+        _render_progress(
+            2,
+            8,
+            "因子原始数据预存完成",
+            started_at,
+            completed=1,
+            total=1,
+            current=factor_name,
+            detail=f"股票域{len(factor_raw_data):,}行",
+        )
 
     signal_fields = [
         "total_market_cap",
@@ -1096,6 +1137,16 @@ def run_market_cap_group_backtest(
         "suspended",
         "volume",
     ]
+    if show_progress:
+        _render_progress(
+            3,
+            8,
+            "预存信号日选股状态",
+            started_at,
+            completed=0,
+            total=1,
+            detail=f"{len(signal_dates)}个信号日",
+        )
     signal_panel = load_daily_raw_data(
         standard_fields=signal_fields,
         dates=signal_dates,
@@ -1111,6 +1162,16 @@ def run_market_cap_group_backtest(
         signal_panel,
         universe_panel,
     )
+    if show_progress:
+        _render_progress(
+            3,
+            8,
+            "信号日选股状态准备完成",
+            started_at,
+            completed=1,
+            total=1,
+            detail=f"{len(signal_panel):,}行",
+        )
 
     execution_fields = [
         "volume",
@@ -1126,6 +1187,16 @@ def run_market_cap_group_backtest(
             execution_fields.append(field)
     execution_fields = list(dict.fromkeys(execution_fields))
 
+    if show_progress:
+        _render_progress(
+            4,
+            8,
+            "预存执行日交易约束",
+            started_at,
+            completed=0,
+            total=1,
+            detail=f"{len(execution_dates)}个执行日",
+        )
     execution_panel = load_daily_raw_data(
         standard_fields=execution_fields,
         dates=execution_dates,
@@ -1142,32 +1213,70 @@ def run_market_cap_group_backtest(
         buy_price_field=buy_price_field,
         sell_price_field=sell_price_field,
     )
+    if show_progress:
+        _render_progress(
+            4,
+            8,
+            "执行日交易约束准备完成",
+            started_at,
+            completed=1,
+            total=1,
+            detail=f"{len(execution_panel):,}行",
+        )
 
     signal_state_by_date = {
         date: group.copy()
         for date, group in signal_panel.groupby("date", sort=False)
     }
     execution_state_map = {}
-    for _, row in execution_panel[
-        [
-            "date",
-            "instrument",
-            "can_buy",
-            "can_sell",
-            "buy_blocked_reason",
-            "sell_blocked_reason",
-            "_buy_price",
-            "_sell_price",
-        ]
-    ].iterrows():
-        execution_state_map[(row["date"], row["instrument"])] = {
-            "can_buy": bool(row["can_buy"]),
-            "can_sell": bool(row["can_sell"]),
-            "buy_blocked_reason": row["buy_blocked_reason"],
-            "sell_blocked_reason": row["sell_blocked_reason"],
-            "buy_price": row["_buy_price"],
-            "sell_price": row["_sell_price"],
+    execution_state_columns = [
+        "date",
+        "instrument",
+        "can_buy",
+        "can_sell",
+        "buy_blocked_reason",
+        "sell_blocked_reason",
+        "_buy_price",
+        "_sell_price",
+    ]
+    execution_state_rows = execution_panel[execution_state_columns]
+    total_execution_rows = len(execution_state_rows)
+    for position, row in enumerate(
+        execution_state_rows.itertuples(index=False, name=None),
+        start=1,
+    ):
+        (
+            row_date,
+            instrument,
+            can_buy,
+            can_sell,
+            buy_blocked_reason,
+            sell_blocked_reason,
+            buy_price,
+            sell_price,
+        ) = row
+        execution_state_map[(row_date, instrument)] = {
+            "can_buy": bool(can_buy),
+            "can_sell": bool(can_sell),
+            "buy_blocked_reason": buy_blocked_reason,
+            "sell_blocked_reason": sell_blocked_reason,
+            "buy_price": buy_price,
+            "sell_price": sell_price,
         }
+        if show_progress and (
+            position == 1
+            or position % 5000 == 0
+            or position == total_execution_rows
+        ):
+            _render_progress(
+                5,
+                8,
+                "建立执行约束快速索引",
+                started_at,
+                completed=position,
+                total=total_execution_rows,
+                current=f"{row_date:%Y-%m-%d} {instrument}",
+            )
 
     schedule_by_signal = {
         row.signal_date: {
@@ -1188,15 +1297,19 @@ def run_market_cap_group_backtest(
     trade_records = []
     completed_signal_count = 0
     successful_signal_count = 0
-    progress_started_at = time.perf_counter()
-
     if show_progress:
-        print(
-            "[市值分组回测] [3/5] 数据准备完成："
-            f"{len(schedule)} 个信号，"
-            f"{len(engine_instruments):,} 只候选股票。"
+        _render_progress(
+            6,
+            8,
+            "启动 BigTrader 原生回测",
+            started_at,
+            completed=0,
+            total=len(schedule),
+            detail=(
+                f"{len(schedule)}个信号，"
+                f"{len(engine_instruments):,}只候选股票"
+            ),
         )
-        print("[市值分组回测] [4/5] 启动 BigTrader 原生回测...")
 
     from bigmodule import M
 
@@ -1229,6 +1342,18 @@ def run_market_cap_group_backtest(
         execution_date = schedule_item["execution_date"]
         rebalance_number = schedule_item["rebalance_number"]
 
+        if show_progress:
+            _render_progress(
+                6,
+                8,
+                "回测中：计算单日因子信号",
+                started_at,
+                completed=completed_signal_count - 1,
+                total=len(schedule),
+                current=f"{signal_date:%Y-%m-%d}",
+                detail=f"第{rebalance_number}次调仓",
+            )
+
         try:
             required_dates = factor_date_windows[signal_date]
             for domain_name in factor_raw_bundle.domain_names:
@@ -1256,6 +1381,17 @@ def run_market_cap_group_backtest(
                 progress_every=progress_every,
                 **resolved_factor_params,
             )
+            if show_progress:
+                _render_progress(
+                    6,
+                    8,
+                    "回测中：市值分组和因子分位选股",
+                    started_at,
+                    completed=completed_signal_count - 1,
+                    total=len(schedule),
+                    current=f"{signal_date:%Y-%m-%d}",
+                    detail=f"因子结果{len(factor_cross_section):,}行",
+                )
             factor_cross_section = _validate_panel(
                 factor_cross_section,
                 f"{factor_name}@{signal_date:%Y-%m-%d}",
@@ -1304,16 +1440,16 @@ def run_market_cap_group_backtest(
         )
 
         if status == "skipped_error":
-            if show_progress and (
-                completed_signal_count == 1
-                or completed_signal_count % progress_every == 0
-                or completed_signal_count == len(schedule)
-            ):
-                _progress_line(
-                    completed_signal_count,
-                    len(schedule),
-                    signal_date,
-                    progress_started_at,
+            if show_progress:
+                _render_progress(
+                    6,
+                    8,
+                    "回测中：当前信号因异常跳过",
+                    started_at,
+                    completed=completed_signal_count,
+                    total=len(schedule),
+                    current=f"{signal_date:%Y-%m-%d}",
+                    detail=error_message,
                 )
             return
 
@@ -1395,6 +1531,8 @@ def run_market_cap_group_backtest(
                 buy_intents.append(intent)
 
         # 先提交卖出/减仓，再提交买入/加仓。
+        total_intents = len(sell_intents) + len(buy_intents)
+        completed_intents = 0
         for direction, intents in (
             ("sell", sell_intents),
             ("buy", buy_intents),
@@ -1450,17 +1588,40 @@ def run_market_cap_group_backtest(
                         "submit_result": submit_result,
                     }
                 )
+                completed_intents += 1
+                if show_progress and (
+                    completed_intents == 1
+                    or completed_intents % 50 == 0
+                    or completed_intents == total_intents
+                ):
+                    _render_progress(
+                        6,
+                        8,
+                        "回测中：提交调仓订单",
+                        started_at,
+                        completed=completed_signal_count - 1,
+                        total=len(schedule),
+                        current=f"{signal_date:%Y-%m-%d}",
+                        detail=(
+                            f"订单{completed_intents}/{total_intents}，"
+                            f"{direction}:{instrument}"
+                        ),
+                    )
 
         if show_progress and (
             completed_signal_count == 1
             or completed_signal_count % progress_every == 0
             or completed_signal_count == len(schedule)
         ):
-            _progress_line(
-                completed_signal_count,
-                len(schedule),
-                signal_date,
-                progress_started_at,
+            _render_progress(
+                6,
+                8,
+                "回测中：调仓信号处理完成",
+                started_at,
+                completed=completed_signal_count,
+                total=len(schedule),
+                current=f"{signal_date:%Y-%m-%d}",
+                detail=f"选中{len(selected)}只，订单意图{total_intents}个",
             )
 
     def handle_order(context, order):
@@ -1578,17 +1739,20 @@ def run_market_cap_group_backtest(
     if benchmark is not None:
         bigtrader_kwargs["benchmark"] = benchmark
 
+    if show_progress:
+        # 避免 BigTrader 原生日志接在单行进度文字之后。
+        print()
     performance = M.bigtrader.v35(**bigtrader_kwargs)
 
     if show_progress:
-        if completed_signal_count:
-            print()
-        elapsed = time.perf_counter() - started_at
-        print(
-            "[市值分组回测] [5/5] 完成："
-            f"{completed_signal_count}/{len(schedule)} 个信号已处理，"
-            f"{successful_signal_count} 个信号成功，"
-            f"耗时 {elapsed:.1f}s。"
+        _render_progress(
+            7,
+            8,
+            "BigTrader运行完成，整理审计结果",
+            started_at,
+            completed=completed_signal_count,
+            total=len(schedule),
+            detail=f"成功信号{successful_signal_count}个",
         )
 
     signals = pd.DataFrame(signal_records)
@@ -1596,6 +1760,21 @@ def run_market_cap_group_backtest(
     execution_audit = pd.DataFrame(execution_records)
     order_audit = pd.DataFrame(order_records)
     trade_audit = pd.DataFrame(trade_records)
+
+    if show_progress:
+        _render_progress(
+            8,
+            8,
+            "回测与审计结果整理完成",
+            started_at,
+            completed=1,
+            total=1,
+            detail=(
+                f"信号{len(signals):,}条，订单{len(order_audit):,}条，"
+                f"成交{len(trade_audit):,}条"
+            ),
+        )
+        print()
 
     data_diagnostics = {
         "requested_start_date": start_date,

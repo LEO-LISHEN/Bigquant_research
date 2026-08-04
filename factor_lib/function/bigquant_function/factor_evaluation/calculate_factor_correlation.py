@@ -144,12 +144,22 @@ def _render_progress(
     stage_total,
     message,
     started_at,
+    completed=None,
+    total=None,
+    current=None,
 ):
     elapsed = time.perf_counter() - started_at
+    parts = [f"[因子相关性] [{stage_number}/{stage_total}] {message}"]
+    if completed is not None and total:
+        parts.append(f"{completed}/{total} ({completed / total:.1%})")
+        if 0 < completed < total:
+            remaining = elapsed / completed * (total - completed)
+            parts.append(f"预计剩余 {remaining:.1f}s")
+    if current is not None:
+        parts.append(f"当前 {current}")
+    parts.append(f"已耗时 {elapsed:.1f}s")
     print(
-        "\r"
-        f"[因子相关性] [{stage_number}/{stage_total}] "
-        f"{message} | 已耗时 {elapsed:.1f}s",
+        "\r" + " | ".join(parts).ljust(200),
         end="",
         flush=True,
     )
@@ -282,6 +292,10 @@ def _load_one_factor(
     factor_params,
     instruments,
     progress_every,
+    show_progress,
+    started_at,
+    factor_position,
+    factor_total,
 ):
     metadata = get_factor_metadata(factor_name)
     requirements = get_factor_data_requirements(
@@ -303,6 +317,19 @@ def _load_one_factor(
         if name not in _RESERVED_FACTOR_PARAMS
     }
 
+    if show_progress:
+        _render_progress(
+            2,
+            7,
+            "逐因子加载原始数据",
+            started_at,
+            completed=factor_position - 1,
+            total=factor_total,
+            current=(
+                f"{factor_name}，所需日期{len(factor_dates)}个，"
+                f"预热{history_days}日"
+            ),
+        )
     raw_data = load_factor_raw_data(
         factor_name=factor_name,
         dates=factor_dates,
@@ -310,6 +337,17 @@ def _load_one_factor(
         instruments=instruments,
         show_progress=False,
     )
+    if show_progress:
+        row_count = sum(raw_data.row_counts().values())
+        _render_progress(
+            3,
+            7,
+            "逐因子计算目标截面",
+            started_at,
+            completed=factor_position - 1,
+            total=factor_total,
+            current=f"{factor_name}，各数据域合计{row_count:,}行",
+        )
     factor_data = get_factor(
         factor_name,
         raw_data,
@@ -319,6 +357,16 @@ def _load_one_factor(
         show_progress=False,
         progress_every=progress_every,
     )
+    if show_progress:
+        _render_progress(
+            3,
+            7,
+            "单个因子计算完成",
+            started_at,
+            completed=factor_position,
+            total=factor_total,
+            current=f"{factor_name}，结果{len(factor_data):,}行",
+        )
 
     factor_column = _resolve_factor_column(
         metadata,
@@ -420,14 +468,13 @@ def _calculate_correlation_from_panel(
         )
         if show_progress and should_refresh:
             _render_progress(
-                4,
                 5,
-                (
-                    f"计算截面 {position}/{total_dates}"
-                    f"（{position / total_dates:.1%}），"
-                    f"当前 {date:%Y-%m-%d}"
-                ),
+                7,
+                "逐截面计算相关矩阵",
                 started_at,
+                completed=position,
+                total=total_dates,
+                current=f"{date:%Y-%m-%d}",
             )
 
     correlation_matrix = correlation_sum.divide(
@@ -613,7 +660,7 @@ def calculate_factor_correlation(
         if show_progress:
             _render_progress(
                 1,
-                5,
+                7,
                 "读取交易日历并生成目标截面",
                 started_at,
             )
@@ -632,17 +679,6 @@ def calculate_factor_correlation(
             factor_names,
             start=1,
         ):
-            if show_progress:
-                _render_progress(
-                    2,
-                    5,
-                    (
-                        f"适配器读取并计算因子 "
-                        f"{position}/{total_factors}：{factor_name}"
-                    ),
-                    started_at,
-                )
-
             factor_panels.append(
                 _load_one_factor(
                     factor_name=factor_name,
@@ -653,18 +689,32 @@ def calculate_factor_correlation(
                     ],
                     instruments=instruments,
                     progress_every=progress_every,
+                    show_progress=show_progress,
+                    started_at=started_at,
+                    factor_position=position,
+                    factor_total=total_factors,
                 )
             )
 
         if show_progress:
             _render_progress(
-                3,
-                5,
+                4,
+                7,
                 "按date + instrument对齐全部因子",
                 started_at,
             )
 
         factor_data = _merge_factor_panels(factor_panels)
+        if show_progress:
+            _render_progress(
+                4,
+                7,
+                "全部因子对齐完成",
+                started_at,
+                completed=len(factor_names),
+                total=len(factor_names),
+                current=f"合并面板{len(factor_data):,}行",
+            )
         correlation_matrix, overlap_days = (
             _calculate_correlation_from_panel(
                 factor_data=factor_data,
@@ -676,14 +726,24 @@ def calculate_factor_correlation(
                 started_at=started_at,
             )
         )
+        if show_progress:
+            _render_progress(
+                6,
+                7,
+                "汇总各截面平均相关系数",
+                started_at,
+                completed=1,
+                total=1,
+                current=f"{len(factor_names)}×{len(factor_names)}矩阵",
+            )
 
         figure = None
         axis = None
         if plot:
             if show_progress:
                 _render_progress(
-                    5,
-                    5,
+                    7,
+                    7,
                     "绘制并展示因子相关系数热力图",
                     started_at,
                 )
@@ -701,8 +761,8 @@ def calculate_factor_correlation(
             )
         elif show_progress:
             _render_progress(
-                5,
-                5,
+                7,
+                7,
                 "计算完成，已按参数跳过绘图",
                 started_at,
             )
