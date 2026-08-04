@@ -1072,7 +1072,7 @@ def run_market_cap_group_backtest(
     if show_progress:
         print("[市值分组回测] [2/5] 预存因子、选股和执行约束数据...")
 
-    factor_raw_data = load_factor_raw_data(
+    factor_raw_bundle = load_factor_raw_data(
         factor_name=factor_name,
         dates=factor_dates,
         factor_params=resolved_factor_params,
@@ -1080,9 +1080,14 @@ def run_market_cap_group_backtest(
         show_progress=False,
     )
     factor_raw_data = _validate_panel(
-        factor_raw_data,
+        factor_raw_bundle.get_security_daily(),
         "factor_raw_data",
         ["date", "instrument"],
+    )
+    factor_raw_bundle = factor_raw_bundle.with_domain(
+        "security_daily",
+        factor_raw_data,
+        key_columns=("date", "instrument"),
     )
 
     signal_fields = [
@@ -1138,10 +1143,6 @@ def run_market_cap_group_backtest(
         sell_price_field=sell_price_field,
     )
 
-    factor_data_by_date = {
-        date: group.copy()
-        for date, group in factor_raw_data.groupby("date", sort=False)
-    }
     signal_state_by_date = {
         date: group.copy()
         for date, group in signal_panel.groupby("date", sort=False)
@@ -1230,23 +1231,22 @@ def run_market_cap_group_backtest(
 
         try:
             required_dates = factor_date_windows[signal_date]
-            raw_parts = [
-                factor_data_by_date[date]
-                for date in required_dates
-                if date in factor_data_by_date
-            ]
-            if len(raw_parts) != len(required_dates):
-                available = {part["date"].iloc[0] for part in raw_parts}
-                missing = [
-                    date.strftime("%Y-%m-%d")
-                    for date in required_dates
-                    if date not in available
-                ]
-                raise ValueError(
-                    f"因子预热窗口缺少日期：{missing[:5]}"
+            for domain_name in factor_raw_bundle.domain_names:
+                missing_dates = factor_raw_bundle.missing_dates(
+                    domain_name,
+                    required_dates,
                 )
+                if len(missing_dates) > 0:
+                    missing_text = [
+                        date.strftime("%Y-%m-%d")
+                        for date in missing_dates[:5]
+                    ]
+                    raise ValueError(
+                        f"数据域 {domain_name!r} 的因子预热窗口"
+                        f"缺少日期：{missing_text}"
+                    )
 
-            factor_input = pd.concat(raw_parts, ignore_index=True)
+            factor_input = factor_raw_bundle.select_dates(required_dates)
             factor_cross_section = get_factor(
                 factor_name,
                 factor_input,
@@ -1603,6 +1603,7 @@ def run_market_cap_group_backtest(
             resolved_factor_params
         ),
         "factor_raw_rows": len(factor_raw_data),
+        "factor_domain_rows": factor_raw_bundle.row_counts(),
         "signal_state_rows": len(signal_panel),
         "execution_state_rows": len(execution_panel),
         "engine_instrument_count": len(engine_instruments),

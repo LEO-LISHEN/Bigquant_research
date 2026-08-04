@@ -186,6 +186,17 @@ FINANCIAL_FIELD_MAPPING = {
 }
 
 
+# 财务适配器虽然独立查询，但其结果已经是日频点时股票面板，因而可以与
+# daily.py 的输出在 security_daily 粒度内按 date + instrument 合并。
+ADAPTER_SPEC = {
+    "name": "financial",
+    "output_group": "security_daily",
+    "key_columns": ("date", "instrument"),
+    "supported_fields": tuple(FINANCIAL_FIELD_MAPPING),
+    "context_parameters": (),
+}
+
+
 def list_supported_financial_fields(table=None):
     """返回当前适配器支持的语义标准财务字段。
 

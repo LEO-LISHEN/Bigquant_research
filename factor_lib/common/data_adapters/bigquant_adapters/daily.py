@@ -125,6 +125,17 @@ DAILY_FIELD_MAPPING = {
 }
 
 
+# 供 loader 自动发现字段归属与输出粒度。映射关系只存在于数据源适配层，
+# 因子 FACTOR 无需记录 BigQuant 表名或数据域名称。
+ADAPTER_SPEC = {
+    "name": "daily",
+    "output_group": "security_daily",
+    "key_columns": ("date", "instrument"),
+    "supported_fields": tuple(DAILY_FIELD_MAPPING),
+    "context_parameters": (),
+}
+
+
 TABLE_SPECS = {
     "bar1d": {
         "name": "cn_stock_bar1d",
