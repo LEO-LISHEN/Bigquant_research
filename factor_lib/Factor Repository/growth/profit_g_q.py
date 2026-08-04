@@ -277,19 +277,16 @@ FACTOR = {
             "date": {
                 "dtype": "datetime64[ns]",
                 "meaning": "目标财务因子截面交易日。",
-                "frequency": "financial",
             },
             "instrument": {
                 "dtype": "string",
                 "meaning": "证券唯一标识。",
-                "frequency": "financial",
             },
             "quarterly_net_profit_yoy": {
                 "dtype": "float64",
                 "meaning": (
                     "截至目标日最新可得的单季度净利润同比增长率。"
                 ),
-                "frequency": "financial",
             },
         },
         "conditional": {},
@@ -359,20 +356,14 @@ FACTOR = {
     "usage_notes": [
         "裸因子版本不进行行业或市值中性化。",
         "策略和研究层应剔除 NaN 因子值，不应填充为 0。",
-        (
-            "BigQuant 财务适配器标准字段 quarterly_net_profit_yoy "
-            "映射到 net_profit_yoy_mrq。"
-        ),
+        "数据适配层必须提供语义一致的 quarterly_net_profit_yoy。",
     ],
     "pit_notes": [
         (
             "必须使用目标日已经可得的财务数据，不能按报告期结束日"
             "提前回填尚未公告的财报。"
         ),
-        (
-            "当前 BigQuant 适配使用日频财务因子表；迁移到其他平台时，"
-            "数据适配层必须按公告/可得时间完成点时对齐。"
-        ),
+        "数据适配层必须按公告日或真实可得时间完成点时对齐。",
         (
             "若数据源存在财报更正或历史重述，应核验其是否保留历史版本，"
             "否则仍可能存在修订数据偏差。"
@@ -384,6 +375,12 @@ FACTOR = {
             "Profit_G_q因子/Profit_G_q.ipynb"
         ),
     ],
-    "status": "migrated_pending_bigquant_validation",
-    "version": "1.0.0",
+    "tags": [
+        "growth",
+        "profit_growth",
+        "quarterly",
+        "cross_sectional",
+    ],
+    "status": "research",
+    "version": "1.1.0",
 }

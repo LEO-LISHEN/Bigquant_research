@@ -1,147 +1,233 @@
 # factor_lib
 
-`factor_lib` 是一个面向量化研究生产化的可复用组件库，用于沉淀因子、公共预处理、因子评价、策略模板和数据源适配逻辑。
+`factor_lib` 用于把分散在研究 Notebook 中的因子、预处理、评价和策略代码，沉淀为可发现、可复用、可检查、可追溯的研究组件。
 
-当前主要运行环境是 BigQuant，但核心设计目标不是绑定 BigQuant，而是让同一个因子公式和研究逻辑能够在更换数据源后继续复用。该项目所说的“生产化”，是指代码可管理、可发现、可复用、可测试和可追溯，不代表已经满足实盘交易系统的全部生产要求。
+当前主要数据和运行平台是 BigQuant。本项目所说的“生产化”是研究工程生产化，不代表已经满足实盘系统在稳定性、监控、容灾、权限和资金安全方面的全部要求。
 
-## 1. 核心原则
+## 1. 当前架构原则
 
-整个项目遵循以下原则：
+1. 因子函数只负责计算因子值。
+2. 因子和公共预处理使用数据源无关的语义字段。
+3. 平台表名、源字段和查询接口只存在于对应平台的数据适配器。
+4. `FACTOR` 只声明需要哪些语义字段，不声明字段属于哪个适配器、数据域或数据表。
+5. loader 根据各适配器的 `ADAPTER_SPEC` 自动完成字段路由。
+6. 不同主键粒度的数据保存在 `FactorDataBundle` 的不同数据域中，不进行无意义广播。
+7. 评价和策略公开入口接收因子名称及因子参数，不要求用户提前传入 `factor_data`。
+8. 评价和策略的编排代码可以依赖当前研究平台；因子公式和公共预处理不能依赖平台。
+9. 可以通过参数表达的同类因子只保留一个参数化脚本。
+10. `target_dates`、数据准备日期和 `as_of_date` 必须严格区分。
+11. 无效值、预热不足和无法计算的结果保留 `NaN`，不得为了表面完整统一填为 0。
+12. 本地检查通过不等于 BigQuant 真实查询或回测已经通过。
 
-1. 因子、数据、评价、策略和执行分层管理。
-2. 核心计算使用统一的语义标准字段，不直接依赖数据供应商字段。
-3. 因子函数只计算因子值，不负责查询数据、构造标签、绘图、选股或回测。
-4. 数据适配器只负责拉取、筛选、映射和对齐原始数据，不负责因子特有的数据处理。
-5. 面向用户的评价函数和策略函数直接接收因子名称，不要求用户提前准备 `factor_data`。
-6. 能通过参数表达的同类因子只保留一个参数化脚本。
-7. 所有研究必须遵守点时性，禁止使用信号时点尚不可获得的信息。
-8. 长时间任务默认静默，可选显示单行刷新的进度；嵌套调用只由最外层显示进度。
-9. 本地语法检查通过不等于 BigQuant 平台运行通过，平台相关功能必须在 BigQuant 中验证。
-
-## 2. 目录结构
-
-目录仅按职责划分。`Factor Repository` 内部可以继续按因子类别扩展，但本 README 不固定具体类别和因子文件。
+## 2. 大类目录
 
 ```text
 factor_lib/
 ├── README.md
+├── LLM_CONTEXT.md
 ├── Factor Repository/
 ├── common/
 │   ├── preprocess/
+│   ├── data_adapters/
 │   ├── factor_evaluation/
-│   ├── strategies/
-│   └── data_adapters/
+│   └── strategies/
 └── factor_hub/
 ```
 
-各大类职责如下：
-
-| 目录 | 职责 |
+| 目录 | 当前职责 |
 |---|---|
-| `Factor Repository/` | 存放因子计算脚本及其 `FACTOR` 元数据；原则上一个参数化因子族一个脚本。 |
-| `common/preprocess/` | 存放可跨因子复用的纯预处理函数，例如去极值、标准化和中性化。 |
-| `common/factor_evaluation/` | 存放因子基础指标、相关性分析及配套绘图等统一评价入口。 |
-| `common/strategies/` | 存放可复用的选股、组合构建和回测策略模板。 |
-| `common/data_adapters/` | 存放不同数据源、数据域和频率的字段映射与原始数据加载逻辑。 |
-| `factor_hub/` | 动态发现、查询、说明和调用因子，避免维护人工巨型登记表。 |
+| `Factor Repository/` | 存放参数化因子脚本以及模块内的 `FACTOR` 元数据。 |
+| `common/preprocess/` | 存放不读取数据源的通用去极值、标准化和中性化函数。 |
+| `common/data_adapters/` | 存放不同平台的数据映射、适配器、loader 和分粒度数据容器。 |
+| `common/factor_evaluation/` | 当前存放自动取数、计算因子、构造标签、计算指标和绘图的评价入口。 |
+| `common/strategies/` | 当前存放依赖 BigTrader 执行的策略回测入口。 |
+| `factor_hub/` | 动态发现、列表、搜索、说明和调用因子。 |
 
-## 3. 总体数据流
+`factor_evaluation` 和 `strategies` 当前确实包含 BigQuant 平台编排代码。以后如调整目录，可以把平台运行器移到单独的平台目录，但不应仅为了追求形式上的“common”而阻碍当前可用性。
 
-推荐的调用链如下：
+## 3. 总体调用链
 
 ```text
-研究、评价或策略公开入口
+评价或策略公开入口
         ↓
-因子中心读取 FACTOR 元数据
+factor_hub 动态读取 FACTOR
         ↓
-解析因子参数和本次数据窗口
+loader 合并默认参数与本次 factor_params
         ↓
-loader 统筹所需数据域
+解析动态 data_window 和条件字段
         ↓
-具体平台适配器拉取并映射原始字段
+读取各适配器的 ADAPTER_SPEC 字段目录
         ↓
-生成使用语义标准字段的 DataFrame
+daily / financial / market_daily 等适配器拉取原始数据
         ↓
-因子函数仅在 target_dates 上计算因子值
+FactorDataBundle 按原始主键粒度保存各数据域
         ↓
-评价、组合构建或平台执行
+get_factor 按因子名称调用计算函数
+        ↓
+因子仅在 target_dates 上返回标准因子面板
+        ↓
+评价指标、组合构建或 BigTrader 执行
 ```
 
-必须区分两类平台依赖：
-
-- **数据源适配器**：处理 BigQuant、其他数据库或本地文件的取数与字段映射。
-- **执行平台适配器或运行器**：处理 BigTrader 等回测/交易引擎的模块、回调、订单和账户接口。
-
-选股规则、组合构建和因子逻辑应尽量保持平台无关。`dai`、SQL、BigQuant 表名、`M.bigtrader`、`context` 和平台回调等内容属于适配或执行层，不应进入因子计算函数。
+策略和评价函数负责决定需要哪些日期；loader 只根据收到的连续区间或日期列表取数，不负责生成调仓计划、评价频率或信号日。
 
 ## 4. 语义标准字段
 
-因子函数声明的是跨数据源的语义字段，例如：
+因子脚本使用稳定的业务语义名称，例如：
 
 ```text
 date
 instrument
-open
 close
-volume
 turn
 pb
 total_market_cap
 industry
+quarterly_net_profit_yoy
+market_close
 ```
 
-这些名称表达字段的业务含义，不表达某个平台的真实表名。平台适配器负责把实际字段映射为标准字段。
+语义字段必须满足：
 
-新增字段前必须先检查：
+- 同一业务含义使用同一个名称；
+- 名称不携带平台表名；
+- 含义足够精确，例如价格复权口径在整个窗口内必须一致；
+- 财务字段说明真实可得时点；
+- 市场共享字段不伪装成逐股票字段。
 
-1. 现有适配器是否已经存在同义字段；
-2. 是否能够沿用现有标准名称；
-3. 字段属于哪个数据域和频率；
-4. 是否满足点时性；
-5. 是否需要新的适配器，而不是把所有数据源逻辑塞进一个脚本。
+`FACTOR` 中不写以下信息：
 
-数据适配器可以执行：
+- `frequency`；
+- `data_domain`；
+- BigQuant 表名；
+- BigQuant 源字段名；
+- SQL；
+- 查询优先级。
 
-- 按日期区间或日期列表拉取数据；
-- 按证券范围过滤；
-- 将平台字段重命名为标准字段；
-- 对不同数据域进行必要的点时对齐；
-- 合并多个适配器返回的数据面板；
-- 检查键列、重复记录和必要字段。
+这些信息由平台适配器负责。
 
-数据适配器不得执行：
+## 5. 数据适配器与 ADAPTER_SPEC
 
-- 因子公式计算；
-- 因子专用缺失值填充；
-- 去极值、标准化或中性化；
-- 标签构造；
-- 股票筛选、分组和组合权重计算；
-- 回测交易逻辑。
+每个平台可以按频率、数据域或表结构继续拆分多个适配器。BigQuant 当前包括日频股票、点时财务和日频市场指数适配器。
 
-## 5. 因子脚本规范
-
-### 5.1 一个参数化因子族一个脚本
-
-仅时间窗口、衰减参数、最小观测数或处理开关不同的因子，应视为同一个因子族。
-
-例如：
-
-```text
-return_1m、return_3m、return_6m
-        ↓
-return_nm.py + n_months 参数
-```
-
-不要因为参数不同复制多个高度相似的脚本。推荐实例可以写入 `FACTOR["best_practice"]`，但不能代替参数化设计。
-
-只有在公式、数据语义或处理流程发生本质变化时，才应新建因子脚本。
-
-### 5.2 统一因子函数接口
-
-推荐接口为：
+每个适配器公开一个 `ADAPTER_SPEC`：
 
 ```python
-def calc_factor(
+ADAPTER_SPEC = {
+    "name": "daily",
+    "output_group": "security_daily",
+    "key_columns": ("date", "instrument"),
+    "supported_fields": tuple(FIELD_MAPPING),
+    "context_parameters": (),
+}
+```
+
+字段含义：
+
+- `name`：适配器注册名称；
+- `output_group`：适配器输出进入哪个数据域；
+- `key_columns`：该输出的唯一主键；
+- `supported_fields`：适配器能够提供的语义字段；
+- `context_parameters`：取数时还需要从因子参数中取得的上下文，例如 `market_index`。
+
+loader 会把所有适配器的 `supported_fields` 组成字段目录。一个语义字段在同一平台只能由一个适配器声明，否则无法自动路由。
+
+适配器允许执行：
+
+- 按连续日期区间或离散日期列表查询；
+- 按证券或指数范围过滤；
+- 把平台字段重命名为语义字段；
+- 按平台规则完成必要的点时对齐；
+- 验证主键、重复记录和返回字段。
+
+适配器不得执行：
+
+- 因子公式；
+- 因子专属缺失值填补；
+- 因子去极值、标准化和中性化；
+- 标签构造；
+- 市值分组和选股；
+- 回测或订单逻辑。
+
+日期选择必须二选一：
+
+```python
+start_date="2022-01-01",
+end_date="2024-12-31",
+```
+
+或：
+
+```python
+dates=["2022-01-04", "2022-02-08"],
+```
+
+不能同时使用两种方式。
+
+## 6. FactorDataBundle
+
+`FactorDataBundle` 用于保存不同主键粒度的原始数据面板。
+
+当前典型数据域：
+
+```text
+security_daily: date + instrument
+market_daily:   date + market_index
+```
+
+这样可以避免把同一个市场指数值复制到当天每一只股票行上。
+
+常用接口：
+
+```python
+bundle.domain_names
+bundle.get_domain("market_daily")
+bundle.get_security_daily()
+bundle.row_counts()
+bundle.missing_dates("market_daily", dates)
+bundle.select_dates(dates)
+bundle.with_domain("security_daily", panel)
+```
+
+容器不查询数据、不计算因子，也不跨粒度自动合并。
+
+## 7. loader
+
+BigQuant loader 的核心入口是：
+
+```python
+load_factor_raw_data(
+    factor_name,
+    start_date=None,
+    end_date=None,
+    dates=None,
+    factor_params=None,
+    instruments=None,
+    adapter_overrides=None,
+    show_progress=False,
+)
+```
+
+loader 的工作顺序：
+
+1. 动态取得因子的 `FACTOR`；
+2. 合并 `parameters` 默认值与调用方传入的 `factor_params`；
+3. 根据条件字段的 `required_when` 决定本次真实所需字段；
+4. 调用 `data_window.resolver` 解析本次预热窗口；
+5. 根据 `ADAPTER_SPEC` 字段目录路由字段；
+6. 从同一份已解析参数中取得适配器上下文；
+7. 调用适配器；
+8. 只合并相同主键粒度的面板；
+9. 返回 `FactorDataBundle`。
+
+loader 不决定研究频率、调仓频率、目标日期、信号日期或执行日期。
+
+## 8. 因子函数接口
+
+推荐接口：
+
+```python
+def calc_factor_name(
     data,
     target_dates=None,
     as_of_date=None,
@@ -152,20 +238,28 @@ def calc_factor(
     ...
 ```
 
-参数含义：
+参数说明：
 
-- `data`：已经由数据适配器准备好的原始数据，可以包含目标日前的预热数据。
-- `target_dates`：实际需要输出因子值的截面日期。它与数据准备日期必须分开。
-- `as_of_date`：本次计算允许使用信息的全局截止日，不能代替 `target_dates`。
-- `show_progress`：是否显示计算进度，默认 `False`。
-- `progress_every`：循环任务每处理多少个单位刷新一次进度。
-- `factor_params`：该因子自身的窗口、衰减、处理开关等参数。
+- `data`：语义字段组成的股票面板，可以包含目标日以前的预热数据；
+- `target_dates`：实际需要输出因子值的截面日期；
+- `as_of_date`：本次计算允许使用信息的全局截止日；
+- `factor_params`：因子窗口、最小观测数、中性化开关等参数；
+- `show_progress`：是否显示进度；
+- `progress_every`：有循环时的刷新间隔。
 
-当 `target_dates=None` 时，函数可以按自身文档约定计算输入数据中所有可计算日期；策略和正式评价入口必须显式传入目标日期。
+`target_dates` 和数据中的所有日期不是同一概念。数据可以包含预热日期，但结果只能包含目标日期。
 
-### 5.3 统一输出
+需要市场指数等共享数据的因子，可以额外声明内部参数：
 
-所有因子函数统一返回长表：
+```python
+domain_data=None
+```
+
+调用者不需要手工传入。`get_factor()` 发现输入是 `FactorDataBundle` 且函数声明了 `domain_data` 后，会自动传入完整容器，同时把 `security_daily` DataFrame 作为 `data`。
+
+## 9. 因子输出
+
+所有因子统一返回：
 
 ```text
 date | instrument | factor_name
@@ -173,631 +267,372 @@ date | instrument | factor_name
 
 要求：
 
-- `date` 是目标因子截面日期；
-- `instrument` 是证券唯一标识；
 - 因子值列名与 `FACTOR["name"]` 一致；
-- 一行对应一个日期和一只证券；
-- 输出只包含目标日期，不应混入仅用于预热的日期；
-- 历史不足、输入无效或无法计算时保留 `NaN`，不得为了“完整”而统一填为 `0`；
-- 结果应按 `date`、`instrument` 稳定排序；
-- 不返回标签、分组、持仓、收益率或图表。
+- 一行对应一个目标日期和一只证券；
+- `date + instrument` 不允许重复；
+- 不输出预热日期；
+- 无效值和无法计算值保留 `NaN`；
+- 不返回标签、分组、收益率、持仓或图表；
+- 按 `date`、`instrument` 稳定排序。
 
-### 5.4 因子内部允许与禁止的内容
+## 10. FACTOR 元数据规范
 
-因子脚本允许：
+每个因子脚本必须在模块顶层声明 `FACTOR`。
 
-- 校验标准输入字段；
-- 校验因子参数；
-- 按 `as_of_date` 截断数据；
-- 调用公共预处理函数；
-- 根据历史窗口计算目标截面因子；
-- 返回标准结果；
-- 声明 `FACTOR` 元数据。
-
-因子脚本禁止：
-
-- 导入 `dai` 并查询数据；
-- 出现 BigQuant 表名或 SQL；
-- 构造未来收益标签；
-- 计算 IC、RankIC 或回测绩效；
-- 进行股票池选择和交易限制过滤；
-- 提交订单；
-- 自动保存文件或展示图表。
-
-## 6. `FACTOR` 元数据规范
-
-每个因子脚本必须在模块顶层提供一个名为 `FACTOR` 的字典。因子中心、loader、评价函数和策略函数都以它为统一契约。
-
-### 6.1 核心必填字段
+### 10.1 核心必填字段
 
 | 字段 | 含义 |
 |---|---|
-| `name` | 因子中心使用的唯一名称，也应与输出因子值列名一致。 |
-| `func` | 实际因子计算函数对象。 |
-| `category` | 因子类别，用于查询和组织。 |
-| `direction` | 经验方向：`1` 表示值越大通常越优，`-1` 表示值越小通常越优。 |
-| `description` | 简明说明因子的经济含义与主要处理流程。 |
-| `formula` | 公式、变量定义和关键计算顺序。 |
-| `input_schema` | 标准输入字段及其类型、频率、含义和条件依赖。 |
-| `parameters` | 因子参数的默认值、合法取值、效果及是否改变数据需求。 |
-| `data_window` | 固定或动态预热窗口、目标日需求、最少历史观测和不足时行为。 |
-| `output_schema` | 输出字段、类型和含义。 |
-| `usage_notes` | 调用方式、参数对应关系和使用限制。 |
-| `pit_notes` | 点时性要求、可用时点和潜在前视风险。 |
+| `name` | 因子唯一名称，也必须是输出因子列名。 |
+| `func` | 因子计算函数对象。 |
+| `category` | 因子类别。 |
+| `direction` | 经验方向：`1` 通常表示高值较优，`-1` 通常表示低值较优。 |
+| `description` | 简要经济含义和处理流程。 |
+| `formula` | 明确公式、变量和处理顺序。 |
+| `input_schema` | 必需字段与条件字段的语义说明。 |
+| `parameters` | 全部公开参数的默认值、合法值和影响。 |
+| `data_window` | 固定或动态预热需求。 |
+| `output_schema` | 输出列、类型和解释。 |
+| `usage_notes` | 适用方式和限制。 |
+| `pit_notes` | 可得时点和潜在前视风险。 |
+| `status` | 当前研究状态。 |
+| `version` | 因子定义版本。 |
 
-### 6.2 输入字段规范
+可选扩展字段：
 
-`input_schema` 至少包含：
+```text
+best_practice
+references
+research_findings
+tags
+deprecation_notes
+change_log
+```
+
+其他因子不需要为了某个扩展字段强制补空值。
+
+### 10.2 input_schema
 
 ```python
 "input_schema": {
     "required": {
         "date": {
             "dtype": "datetime64[ns] 或可解析日期",
-            "frequency": "daily",
-            "meaning": "观测日期及目标因子截面日期",
+            "meaning": "观测日期及目标因子截面日期。",
         },
         "instrument": {
             "dtype": "string",
-            "frequency": "daily",
-            "meaning": "证券唯一标识",
+            "meaning": "证券唯一标识。",
+        },
+        "close": {
+            "dtype": "float",
+            "meaning": "与因子定义一致且窗口内口径统一的复权收盘价。",
         },
     },
     "conditional": {
         "industry": {
             "dtype": "string",
-            "frequency": "daily",
-            "meaning": "目标日可得的历史行业分类",
-            "required_when": "neutralize_industry=True",
+            "meaning": "目标日可得的行业分类。",
+            "required_when": {"neutralize_industry": True},
         },
     },
 }
 ```
 
-每个字段都应说明：
+字段规范中不记录适配器或数据域。
 
-- 标准字段名；
-- 数据类型；
-- 数据频率或所属数据域；
-- 业务含义；
-- 条件字段在什么参数条件下必需。
+### 10.3 parameters
 
-不得在这里写死 BigQuant 表名。具体表和真实字段属于平台适配器。
-
-### 6.3 参数规范
-
-每个公开因子参数至少说明：
+每个函数公开参数必须登记：
 
 ```python
-"parameters": {
-    "n_months": {
-        "default": 6,
-        "accepted_values": "正整数",
-        "effect": "决定因子回看月份数",
-        "changes_data_requirements": True,
-    },
+"n_months": {
+    "default": 6,
+    "accepted_values": "正整数。",
+    "effect": "决定回看月份数。",
+    "changes_data_requirements": True,
 }
 ```
 
-其中：
+`parameters` 的默认值必须与真实函数签名一致。
 
-- `default`：默认值；
-- `accepted_values`：合法范围或可选值；
-- `effect`：对公式或结果的影响；
-- `changes_data_requirements`：是否会改变所需字段或预热窗口。
+`data` 和内部使用的 `domain_data` 不登记为普通因子参数。`target_dates`、`as_of_date`、`show_progress` 和 `progress_every` 需要登记，因为它们属于公开统一接口，但评价和策略调用时由外层控制。
 
-策略和评价函数必须用同一份已经解析的 `factor_params` 同时完成数据窗口解析和最终因子计算，避免“按一个窗口取数、按另一个窗口计算”。
+### 10.4 data_window
 
-### 6.4 固定与动态数据窗口
-
-固定窗口可以直接写在 `data_window["default"]` 中。
-
-参数会改变窗口时，必须提供解析函数：
-
-```python
-def _resolve_example_data_window(resolved_params):
-    n_months = resolved_params.get("n_months", 6)
-    trading_days_per_month = resolved_params.get(
-        "trading_days_per_month",
-        21,
-    )
-    lookback_days = n_months * trading_days_per_month
-
-    return {
-        "lookback_trading_days": lookback_days,
-        "requires_target_date_data": True,
-        "minimum_history_observations": lookback_days,
-        "preheating_required": True,
-        "insufficient_window_behavior": "历史不足时输出 NaN",
-    }
-```
-
-对应元数据：
+固定窗口直接声明：
 
 ```python
 "data_window": {
-    "resolver": _resolve_example_data_window,
+    "lookback_trading_days": 0,
+    "requires_target_date_data": True,
+    "minimum_history_observations": 0,
+    "preheating_required": False,
+    "insufficient_window_behavior": "无法计算时保留 NaN。",
+}
+```
+
+参数影响窗口时使用 resolver：
+
+```python
+"data_window": {
+    "resolver": _resolve_factor_data_window,
     "default": {
         "lookback_trading_days": 126,
         "requires_target_date_data": True,
         "minimum_history_observations": 126,
         "preheating_required": True,
-        "insufficient_window_behavior": "历史不足时输出 NaN",
+        "insufficient_window_behavior": "历史不足时保留 NaN。",
     },
-    "resolver_notes": (
-        "loader 和因子函数必须使用同一份 resolved_factor_params。"
-    ),
+    "resolver_notes": "窗口由 n_months 和 trading_days_per_month 决定。",
 }
 ```
 
-`data_window` 至少明确：
+策略和评价必须使用 loader 解析出的同一份 `resolved_factor_params` 完成预热和最终计算，防止参数错位。
 
-- `lookback_trading_days`：目标日前需要回看的交易日数量；
-- `requires_target_date_data`：公式是否需要目标日数据；
-- `minimum_history_observations`：单只证券最少有效历史观测数；
-- `preheating_required`：是否必须准备预热数据；
-- `insufficient_window_behavior`：预热不足时如何处理；
-- 动态窗口的 `resolver` 和解析说明。
+### 10.5 direction
 
-### 6.5 可扩展字段
+`direction` 是因子的经验研究信息，不自动决定所有策略的选股顺序。
 
-不同因子可以按需要增加以下字段，其他因子无需被迫同步增加：
+当前市值分组策略中的 `factor_quantile_range` 明确定义为：
 
-- `best_practice`
-- `references`
-- `research_findings`
-- `tags`
-- `status`
-- `version`
-- `deprecation_notes`
-- `change_log`
-
-核心字段必须统一，可扩展字段按实际研究需要增加。
-
-### 6.6 完整骨架
-
-```python
-FACTOR = {
-    "name": "example_factor_nm",
-    "func": calc_example_factor_nm,
-    "category": "example",
-    "direction": 1,
-    "description": "因子经济含义和主要处理流程。",
-    "formula": "清晰写明公式、变量和计算顺序。",
-    "input_schema": {
-        "required": {
-            "date": {
-                "dtype": "datetime64[ns] 或可解析日期",
-                "frequency": "daily",
-                "meaning": "观测日期",
-            },
-            "instrument": {
-                "dtype": "string",
-                "frequency": "daily",
-                "meaning": "证券唯一标识",
-            },
-        },
-        "conditional": {},
-    },
-    "parameters": {},
-    "data_window": {
-        "resolver": _resolve_example_data_window,
-        "default": {
-            "lookback_trading_days": 0,
-            "requires_target_date_data": True,
-            "minimum_history_observations": 1,
-            "preheating_required": False,
-            "insufficient_window_behavior": "无法计算时输出 NaN",
-        },
-        "resolver_notes": "说明窗口与参数之间的关系。",
-    },
-    "output_schema": {
-        "date": {
-            "dtype": "datetime64[ns]",
-            "meaning": "目标因子截面日期",
-        },
-        "instrument": {
-            "dtype": "string",
-            "meaning": "证券唯一标识",
-        },
-        "example_factor_nm": {
-            "dtype": "float64",
-            "meaning": "因子值含义",
-        },
-    },
-    "usage_notes": [],
-    "pit_notes": [],
-    "best_practice": {},
-    "status": "research",
-    "version": "1.0.0",
-}
+```text
+原始因子值从小到大的分位区间
 ```
 
-## 7. 公共预处理函数规范
+例如 `(0.0, 0.1)` 选择每个市值组内原始因子值最低的约 10%，`(0.9, 1.0)` 选择最高的约 10%。调用者必须根据研究目标显式指定区间，策略不会根据 `direction` 自动翻转。
 
-公共预处理函数应遵循：
+## 11. 因子中心
 
-1. 一个可复用操作一个脚本；
-2. 不读取数据源；
-3. 不包含特定因子名称和策略逻辑；
-4. 默认不擅自填充缺失值；
-5. 尽量保持输入索引，避免样本错位；
-6. 明确函数处理的是单日截面还是完整面板；
-7. 暴露 `show_progress=False`，有循环时同时暴露 `progress_every=20`；
-8. 被因子函数嵌套调用时保持静默。
-
-底层通用函数和上层便捷函数可以同时存在。例如：
-
-- 底层 OLS 残差函数负责一般线性中性化；
-- 上层市值行业中性化函数负责构造常用控制变量，再调用底层函数。
-
-因子优先调用语义最贴近需求的公共函数；只有出现新的通用能力时才扩展 `preprocess`，不要在多个因子脚本中复制相同实现。
-
-## 8. 因子中心规范
-
-因子中心通过扫描因子脚本中的 `FACTOR` 自动发现因子，不维护人工巨型 `FACTOR_REGISTRY`。
-
-建议公开能力：
-
-- `discover_factors()`：扫描并建立当前因子索引；
-- `list_factors()`：列出可用因子的摘要；
-- `search_factors()`：按名称、类别、描述或标签搜索；
-- `describe_factor()`：查看某个因子的完整元数据；
-- `get_factor()`：按因子名称调用真实计算函数。
-
-典型用法：
+因子中心不维护人工巨型登记表。
 
 ```python
-from factor_lib.factor_hub.list_factors import list_factors
-from factor_lib.factor_hub.search_factors import search_factors
-from factor_lib.factor_hub.describe_factor import describe_factor
-
-display(list_factors())
-display(search_factors("momentum"))
-display(describe_factor("factor_name"))
+discover_factors()
+list_factors()
+search_factors(keyword)
+describe_factor(name)
+get_factor(name, data, **params)
 ```
 
-新增因子时，只需：
+新增因子只需把脚本放入 `Factor Repository` 的适当类别目录并声明 `FACTOR`。Notebook 已经导入旧版本时应重启内核。
 
-1. 将脚本放入 `Factor Repository` 的合适类别目录；
-2. 提供符合规范的计算函数和 `FACTOR`；
-3. 重新启动 Notebook 内核或刷新因子发现缓存。
+## 12. 公共预处理
 
-不需要在中心登记表中重复手工登记。
+公共预处理函数必须：
 
-## 9. 因子评价规范
+- 不读取平台数据；
+- 不出现因子名称或策略逻辑；
+- 保留输入索引；
+- 默认不填充缺失值；
+- 明确处理单日截面还是完整面板；
+- 被因子嵌套调用时保持静默。
 
-面向研究者的公开评价函数应直接接收：
+当前典型能力：
 
-- 起始日期；
-- 结束日期；
-- 评价频率；
-- 因子名称或因子名称列表；
-- 因子参数；
-- 可选证券范围；
-- 指标、绘图和进度参数。
+- `winsorize_mad`：MAD 去极值；
+- `zscore`：可选择 `ddof` 的截面标准化；
+- `neutralize_ols`：一般 OLS 残差；
+- `neutralize_size_industry`：市值及可选行业中性化。
 
-公开入口不应要求用户提前传入 `factor_data` 或 `label_data`。评价函数内部负责：
+因子应优先调用语义最贴近需求的公共函数。例如 BP 使用 `neutralize_size_industry(..., standardize_residual=False)` 取得残差，再按原定义执行 MAD 和 Z-score。
 
-1. 生成评价截面；
-2. 读取 `FACTOR`；
-3. 解析因子参数和预热窗口；
-4. 调用 loader 拉取原始数据；
-5. 调用因子函数；
-6. 构造点时一致的完整未来标签；
-7. 计算指标；
-8. 按参数决定是否绘图。
+## 13. 因子评价
 
-内部私有纯函数为了便于单元测试，可以接收已经准备好的 DataFrame；“不接收 `factor_data`”的要求针对面向用户的公开入口。
-
-### 9.1 基础指标
+公开基础评价入口接收：
 
 ```python
-from factor_lib.common.factor_evaluation.calculate_factor_basic_metrics import (
-    calculate_factor_basic_metrics,
-)
-
-result = calculate_factor_basic_metrics(
-    start_date="2022-01-01",
-    end_date="2024-12-31",
-    frequency=20,
-    factor_name="factor_name",
-    factor_params={},
+calculate_factor_basic_metrics(
+    start_date,
+    end_date,
+    frequency,
+    factor_name,
+    factor_params=None,
     instruments=None,
     min_obs=30,
     plot=True,
-    show_progress=True,
+    plot_title=None,
+    figsize=(14, 5),
+    show_progress=False,
+    progress_every=20,
 )
-
-display(result["summary"])
 ```
 
-基础评价中的未来收益只是研究标签，不等同于可成交的组合回测收益。结束日前无法完整结束的未来标签必须剔除。
+它内部负责：
 
-### 9.2 因子相关性
+1. 生成评价截面；
+2. 解析因子窗口；
+3. 调用 loader 和因子中心；
+4. 构造完整结束的未来收益标签；
+5. 计算 IC、RankIC、ICIR、RankICIR、因子收益和平均 t 值；
+6. 可选绘制 IC/RankIC 时序图。
+
+未来收益是研究标签，不是可成交策略收益。研究结束日前尚未完整结束的标签必须剔除。
+
+相关性入口为：
 
 ```python
-from factor_lib.common.factor_evaluation.calculate_factor_correlation import (
-    calculate_factor_correlation,
-)
-
-result = calculate_factor_correlation(
-    start_date="2022-01-01",
-    end_date="2024-12-31",
-    frequency=20,
-    factor_names=[
-        "factor_a",
-        "factor_b",
-    ],
-    factor_params_by_name={
-        "factor_a": {},
-        "factor_b": {},
-    },
+calculate_factor_correlation(
+    start_date,
+    end_date,
+    frequency,
+    factor_names,
+    factor_params_by_name=None,
+    instruments=None,
     method="spearman",
     min_obs=30,
     plot=True,
-    show_progress=True,
+    plot_title=None,
+    figsize=(10, 8),
+    annotate=True,
+    show_progress=False,
+    progress_every=20,
 )
-
-display(result["correlation_matrix"])
 ```
 
-相关性应优先计算同一日期、同一股票上的截面相关系数，再对有效日期汇总；不能把整个面板直接混在一起计算而忽略日期结构。
+它接收因子名称列表和每个因子的独立参数，分别解析字段和预热窗口，对齐相同日期与证券后，先计算逐日截面相关系数，再汇总和可选绘图。
 
-## 10. 策略函数规范
+评价入口当前依赖 BigQuant 数据适配器获取交易日历、因子原始数据和标签价格，这是当前平台编排职责，不影响因子函数本身的数据源独立性。
 
-面向用户的策略公开入口应接收：
+## 14. 市值分组回测
 
-- 回测起止日期；
-- 调仓频率或触发规则；
-- 选股范围；
-- 因子名称；
-- 因子参数；
-- 组合构建参数；
-- 交易价格；
-- 初始资金；
-- 基准；
-- 交易成本、税费、滑点和成交量限制；
-- 进度参数。
-
-不应要求用户传入已经计算好的 `factor_data`。
-
-推荐流程：
-
-1. 根据回测区间和交易日历生成调仓执行日；
-2. 明确信号日与执行日；
-3. 根据 `FACTOR` 和因子参数解析预热窗口；
-4. 分别准备因子数据日期和交易限制数据日期；
-5. 通过 loader 一次性或分块加载原始数据；
-6. 在信号日调用因子函数，只计算所需截面；
-7. 根据 `FACTOR["direction"]`、选股规则和组合规则生成目标持仓；
-8. 在执行日检查 ST、停牌、涨跌停、成交量等限制；
-9. 通过平台执行器提交订单；
-10. 返回平台绩效对象和可选审计数据。
-
-默认的安全时序是：
-
-```text
-T 日收盘后获得完整 T 日数据并产生信号
-                    ↓
-T+1 交易日按设定价格执行
-```
-
-如果使用其他时序，必须明确该时点真实可获得的数据，并证明不存在使用未来信息或使用尚未形成的价格成交。
-
-市值分组回测示例：
+公开入口：
 
 ```python
-from factor_lib.common.strategies.market_cap_group_backtest import (
-    run_market_cap_group_backtest,
-)
-
-result = run_market_cap_group_backtest(
-    start_date="2022-01-01",
-    end_date="2024-12-31",
-    rebalance_interval=20,
-    universe={"type": "all_a"},
-    factor_name="factor_name",
-    factor_params={},
+run_market_cap_group_backtest(
+    start_date,
+    end_date,
+    rebalance_interval,
+    universe,
+    factor_name,
     market_cap_group_count=15,
-    selected_market_cap_groups=[1, 2, 3],
+    selected_market_cap_groups=None,
     factor_quantile_range=(0.0, 0.1),
+    factor_params=None,
     order_price_field_buy="open",
     order_price_field_sell="open",
     initial_cash=1_000_000,
     benchmark="000300.SH",
-    trading_costs={
-        "buy_cost": 0.0003,
-        "sell_cost": 0.0003,
-        "min_cost": 5.0,
-        "tax_ratio": 0.0005,
-    },
-    slippage_value=0.001,
+    trading_costs=None,
+    slippage_value=None,
     volume_limit=0.025,
-    show_progress=True,
+    weight_tolerance=1e-4,
+    show_progress=False,
+    progress_every=20,
 )
 ```
 
-公开调用默认只展示 BigQuant 回测图表。信号、调仓、执行、订单和成交审计表应通过返回结果显式查看，避免 Notebook 自动刷出大量中间内容。
+股票池支持：
 
-## 11. 点时性与防前视
+- 全部 A 股；
+- 一个或多个指数的历史成分股；
+- 固定自定义证券列表。
 
-所有因子、评价和策略必须遵守：
+核心流程：
 
-1. 目标日因子只能使用目标日及以前真实可得的数据；
-2. `as_of_date` 之后的数据必须截断；
-3. 财务数据按公告日或真实可用日对齐，不能仅按报告期结束日回填历史；
-4. 行业、指数成分、风险警示和停牌状态必须使用历史状态；
-5. 未来收益只能作为标签，不能进入因子输入；
-6. 中性化和分组使用的截面股票池必须明确；
-7. 使用 T 日收盘数据生成的信号不能按 T 日收盘价成交；
-8. 评价结束日之后才完整形成的标签必须剔除；
-9. 预热不足时保留 `NaN`，不能使用未来数据补齐；
-10. 任何缓存都不能让上一次运行的闭包、信号或参数污染本次回测。
+1. 生成交易日调仓计划；
+2. 执行日前一交易日作为信号日；
+3. 根据因子参数解析每个信号日的预热窗口；
+4. 分别预存因子数据、信号日选股状态和执行日交易限制；
+5. 在信号日调用因子函数，仅计算该截面；
+6. 按总市值从小到大划分近似等数量组；
+7. 在每个指定组内按原始因子值分位区间选股；
+8. 合并后全局等权；
+9. 订单在下一交易日由 BigTrader 撮合；
+10. 保留信号、调仓、执行、订单和成交审计表。
 
-## 12. 进度、输出与 Notebook 缓存
+交易限制包括历史 ST/风险警示、停牌、成交量、执行价格、涨停买入和跌停卖出限制。无法卖出的旧持仓继续占用资金，无法买入的目标保留现金，不使用未来信息寻找替补股票。
 
-公共因子、预处理、评价和策略函数统一支持：
+策略依赖 BigQuant 原生 BigTrader 执行，这是策略运行器的正常平台依赖。由于回调闭包持有本次计划、数据和审计容器，必须设置：
+
+```python
+m_cached=False
+```
+
+避免复用上一次回测结果。
+
+## 15. 点时性
+
+必须区分：
+
+```text
+报告期
+公告或真实可得日
+原始数据日期
+目标因子日
+信号日
+订单提交日
+执行日
+标签结束日
+研究结束日
+```
+
+默认安全约定：
+
+- 因子只使用目标日及以前真实可得的信息；
+- 财务数据按公告或平台真实可得时间进入；
+- 行业、指数成分、风险状态和停牌状态使用历史值；
+- T 日收盘信息形成的信号不按 T 日收盘价成交；
+- 未来收益只用于已完整结束的历史标签；
+- 预热不足保留 `NaN`；
+- 当前股票池和当前行业不能回填到历史。
+
+## 16. 进度与缓存
+
+长时间入口默认静默，支持：
 
 ```python
 show_progress=False
 progress_every=20
 ```
 
-规范：
+有循环时使用 `\r` 单行刷新，显示阶段、完成度、当前日期或任务、耗时和预计剩余时间。嵌套调用只由最外层显示进度，结束或异常退出时补换行。
 
-- 默认静默；
-- 使用 `\r` 在终端单行刷新；
-- 显示阶段、完成度、当前日期或任务、已耗时和预计剩余时间；
-- 嵌套调用时只有最外层函数显示进度；
-- 完成或异常退出时补换行；
-- 不在循环中刷出大量日志；
-- 不自动展示大型 DataFrame；
-- 不自动写入研究结果文件。
+修改 `.py` 后，BigQuant Notebook 可能仍保留旧模块：
 
-BigQuant Notebook 会缓存已经导入的 Python 模块。修改因子库、适配器、评价函数或策略后，最可靠的做法是重启内核后重新运行。
+1. 保存文件；
+2. 重启内核；
+3. 从头运行；
+4. 再比较结果。
 
-```python
-sys.dont_write_bytecode = True
-```
+`sys.dont_write_bytecode = True` 只能阻止生成新的 `__pycache__`，不能清除已经导入的模块。
 
-只能阻止生成新的 `__pycache__` 字节码文件，不能清除内存中已经导入的旧模块。
+## 17. 迁移新因子
 
-对于当前依赖 Notebook 闭包状态的 BigTrader 回测，必须关闭模块结果缓存，例如使用：
+1. 从旧 Notebook 找到真正的裸因子公式；
+2. 分离 SQL、标签、评价、图表和回测；
+3. 搜索是否存在可以继续参数化的同类因子；
+4. 识别可复用预处理；
+5. 确定唯一语义字段名称；
+6. 在正确平台适配器中补充字段映射；
+7. 编写因子函数和完整 `FACTOR`；
+8. 核对动态预热窗口；
+9. 用相同日期和股票池对照旧结果；
+10. 再进行统一评价和含成本回测；
+11. 更新版本和 Git 记录。
 
-```python
-m_cached=False
-```
+不要因时间窗口不同复制脚本。例如 `return_1m`、`return_3m` 和 `return_6m` 应统一为 `return_nm` 并通过参数控制。
 
-否则相同模块参数可能命中旧缓存，导致本次回测没有执行新的回调或错误展示上一次结果。
+## 18. 验证边界
 
-## 13. 从旧 Notebook 迁移因子
+建议明确交付达到的验证等级：
 
-迁移流程：
+| 等级 | 含义 |
+|---|---|
+| L1 | 仅静态阅读。 |
+| L2 | 语法、AST 和导入检查。 |
+| L3 | 构造数据或本地纯函数测试。 |
+| L4 | BigQuant 真实数据查询和字段验证。 |
+| L5 | BigTrader 回测、回调、订单和成交审计验证。 |
+| L6 | 模拟盘生命周期、状态和订单验证。 |
+| L7 | 小规模实盘验证。 |
 
-1. 找到旧 Notebook 中真正的裸因子公式；
-2. 分离 SQL、数据清洗、标签、评价、图表和回测代码；
-3. 搜索因子库，确认是否已存在可参数化的同类因子；
-4. 检查预处理步骤能否复用现有公共函数；
-5. 若是通用操作，将其独立放入 `common/preprocess`；
-6. 为全部原始输入确定唯一的语义标准字段；
-7. 检查对应数据适配器是否已有映射；
-8. 编写因子计算函数；
-9. 完整填写 `FACTOR`；
-10. 用相同日期、相同股票池对照旧结果；
-11. 通过统一基础指标和 IC/RankIC 时序验证；
-12. 再用带交易成本和交易限制的策略回测验证；
-13. 记录版本和有意义的 Git 变更。
+不得把 L2 或 L3 表述为已经在 BigQuant 真实运行。
 
-迁移时必须尽量保留原研究的：
+## 19. Git 与协作
 
-- 原始公式；
-- 数据口径；
-- 处理顺序；
-- 截面范围；
-- 标准差自由度等统计细节；
-- 因子方向；
-- 有效样本要求。
-
-如果主动改变这些内容，应视为新版本或新定义，并在元数据和版本记录中说明。
-
-## 14. 版本、状态与废弃
-
-建议因子使用清晰状态：
-
-```text
-draft → research → validated → deprecated
-```
-
-- `draft`：正在迁移或开发；
-- `research`：可以用于研究，但尚未完成充分验证；
-- `validated`：已通过定义对照、统一评价和指定策略验证；
-- `deprecated`：保留兼容性，但不建议新研究继续使用。
-
-下列变化应更新版本或变更记录：
-
-- 公式变化；
-- 输入字段含义变化；
-- 预处理顺序变化；
-- 点时口径变化；
-- 默认参数变化；
-- 因子方向变化；
-- 输出语义变化。
-
-仅修改文字说明或不影响数值结果的代码整理，可以只记录普通提交。
-
-GitHub 用于保存可复现代码和有意义的变更记录。原始大数据、临时缓存和无必要的运行产物不应提交。研究结论属于文档或元数据扩展字段，不能写进因子计算流程并改变其职责。
-
-## 15. 新增或修改组件的检查清单
-
-### 新增因子
-
-- [ ] 已搜索现有因子，确认不是同类参数实例；
-- [ ] 相同公式的窗口差异已经参数化；
-- [ ] 函数只接收标准字段；
-- [ ] 没有 `dai`、SQL、平台表名和策略代码；
-- [ ] `data` 与 `target_dates` 分离；
-- [ ] `as_of_date` 截止逻辑明确；
-- [ ] 输出仅含 `date`、`instrument` 和因子列；
-- [ ] 预热不足输出 `NaN`；
-- [ ] `FACTOR` 核心字段完整；
-- [ ] 动态参数能够正确解析数据窗口；
-- [ ] 已检查适配器字段映射；
-- [ ] 已与旧定义或参考实现对照。
-
-### 新增预处理
-
-- [ ] 操作可被多个因子复用；
-- [ ] 没有数据源和因子专属逻辑；
-- [ ] 索引与缺失值行为明确；
-- [ ] 截面或时序处理范围明确；
-- [ ] 没有重复实现现有函数。
-
-### 新增评价函数
-
-- [ ] 公开入口接收因子名称而非 `factor_data`；
-- [ ] 自动解析参数和预热窗口；
-- [ ] 标签完整且无前视；
-- [ ] 绘图由参数控制；
-- [ ] 返回结构包含必要结果与审计数据。
-
-### 新增策略
-
-- [ ] 公开入口接收因子名称和因子参数；
-- [ ] 信号日与执行日明确；
-- [ ] 使用同一份因子参数取数和计算；
-- [ ] 股票池使用历史状态；
-- [ ] 考虑 ST、停牌、涨跌停和成交量限制；
-- [ ] 考虑佣金、税费和滑点；
-- [ ] 订单失败和未成交有审计记录；
-- [ ] 平台执行代码与通用组合逻辑边界清晰。
-
-## 16. 面向 LLM 的强制约定
-
-LLM 在修改本项目时必须：
-
-1. 先阅读本 README；
-2. 先搜索是否已有因子、字段映射和公共预处理；
-3. 优先扩展参数，不复制同类因子脚本；
-4. 根据 `FACTOR` 自动解析字段和数据窗口；
-5. 保证取数与计算使用同一份已解析因子参数；
-6. 保留公式、数据口径和处理顺序；
-7. 明确本地验证与 BigQuant 平台验证的边界；
-8. 对公式或时序变化进行版本说明；
-9. 修改库文件后提醒重启 Notebook 内核；
-10. 为长任务提供默认静默的单行进度。
-
-LLM 不得：
-
-1. 在因子函数中加入 SQL、数据表名、标签、图表、选股或订单；
-2. 让公开评价或策略接口要求用户手工传入 `factor_data`；
-3. 把不同窗口的同一公式拆成多个因子脚本；
-4. 在多个因子中复制同一预处理实现；
-5. 为了消除缺失值而统一填 `0`；
-6. 使用未来财务公告、未来成分股或未来交易状态；
-7. 把语法检查通过表述为 BigQuant 回测或交易已经验证成功；
-8. 未说明原因就改变公式、因子方向、默认参数或交易时序。
-
----
-
-本 README 是 `factor_lib` 的架构契约。新增组件时，应优先保持该契约稳定；确需改变公共接口或职责边界时，应先更新本文档，再同步修改相关代码和调用示例。
+- GitHub 保存可复现代码和有意义的变更记录；
+- 不提交数据、凭据或无意义缓存；
+- 提交前检查 `git status` 和暂存区统计；
+- `git add -A` 会同时暂存删除文件；
+- 修改因子、适配器或策略后，在 Notebook 中重启内核；
+- 新的 LLM 或协作者应先阅读本文件和 `LLM_CONTEXT.md`。

@@ -483,26 +483,22 @@ FACTOR = {
         "required": {
             "date": {
                 "dtype": "datetime64[ns] 或可解析日期",
-                "data_domain": "daily",
                 "meaning": "日频观测日期和目标因子截面日期。",
             },
             "instrument": {
                 "dtype": "string",
-                "data_domain": "daily",
                 "meaning": (
                     "证券唯一标识；同一date+instrument不允许重复。"
                 ),
             },
             "turn": {
                 "dtype": "float",
-                "data_domain": "daily",
                 "meaning": (
                     "日换手率；小于等于0的记录不参与滚动标准差。"
                 ),
             },
             "total_market_cap": {
                 "dtype": "float",
-                "data_domain": "daily",
                 "meaning": (
                     "目标日总市值；取自然对数后作为截面中性化控制变量。"
                 ),
@@ -511,7 +507,6 @@ FACTOR = {
         "conditional": {
             "industry": {
                 "dtype": "string",
-                "data_domain": "daily",
                 "meaning": "目标日一级行业分类，用于构造行业哑变量。",
                 "required_when": {
                     "neutralize_industry": True,
@@ -709,5 +704,5 @@ FACTOR = {
         "parameterized_window",
     ],
     "status": "research",
-    "version": "1.0.0",
+    "version": "1.1.0",
 }

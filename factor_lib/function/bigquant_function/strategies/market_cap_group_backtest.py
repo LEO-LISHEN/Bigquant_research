@@ -1570,6 +1570,10 @@ def run_market_cap_group_backtest(
         "volume_limit": volume_limit,
         "order_price_field_buy": buy_price_field,
         "order_price_field_sell": sell_price_field,
+        # 回调函数闭包中保存了本次调仓计划、因子数据和审计容器。
+        # 必须关闭模块结果缓存，避免复用上一次运行的回测结果，导致
+        # 当前回调未执行或审计记录仍为零。
+        "m_cached": False,
     }
     if benchmark is not None:
         bigtrader_kwargs["benchmark"] = benchmark

@@ -302,12 +302,10 @@ FACTOR = {
         "required": {
             "date": {
                 "dtype": "datetime64[ns] 或可解析日期",
-                "frequency": "daily",
                 "meaning": "日频观测日期及目标因子截面日期。",
             },
             "instrument": {
                 "dtype": "string",
-                "frequency": "daily",
                 "meaning": (
                     "证券唯一标识；同一 date + instrument "
                     "不允许重复。"
@@ -315,9 +313,9 @@ FACTOR = {
             },
             "close": {
                 "dtype": "float",
-                "frequency": "daily",
                 "meaning": (
-                    "日收盘价；BigQuant 适配器映射为后复权收盘价。"
+                    "与因子定义一致的复权收盘价；"
+                    "整个回看窗口必须使用同一复权口径。"
                 ),
             },
         },
@@ -423,8 +421,8 @@ FACTOR = {
             "若使用目标日收盘价形成信号，最早应在下一可交易时点执行。"
         ),
         (
-            "BigQuant cn_stock_bar1d.close 为后复权价格；"
-            "迁移对照时应与旧 notebook 保持相同复权口径。"
+            "不同数据源的复权方式可能不同；迁移和结果对照时必须"
+            "保持相同的价格复权口径。"
         ),
     ],
     "references": [
@@ -436,5 +434,5 @@ FACTOR = {
         "parameterized_window",
     ],
     "status": "research",
-    "version": "1.0.0",
+    "version": "1.1.0",
 }

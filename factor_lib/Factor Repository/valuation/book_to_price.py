@@ -6,7 +6,9 @@ import time
 import numpy as np
 import pandas as pd
 
-from factor_lib.common.preprocess.neutralize_ols import neutralize_ols
+from factor_lib.common.preprocess.neutralize_size_industry import (
+    neutralize_size_industry,
+)
 from factor_lib.common.preprocess.winsorize_mad import winsorize_mad
 from factor_lib.common.preprocess.zscore import zscore
 
@@ -50,7 +52,7 @@ def calc_book_to_price(
 
     处理流程：
     BP 原始值 → 市值中性化（可选叠加行业中性化）→ MAD 去极值
-    → Z-score 标准化 → 缺失值填 0。
+    → Z-score 标准化。无法计算的记录保留 NaN。
 
     参数
     ----
@@ -67,7 +69,7 @@ def calc_book_to_price(
         MAD 去极值倍数，必须大于 0。
     min_cs_count : int，默认 30
         单个截面的最小有效回归样本数，必须为正整数。样本不足时，
-        预处理函数产生的缺失结果会在最后统一填为 0。
+        该截面无法计算的结果保留为 NaN。
     show_progress : bool，默认 False
         是否以单行刷新形式显示截面计算进度。
     progress_every : int，默认 20
@@ -175,30 +177,28 @@ def calc_book_to_price(
             valid_pb = cross_section["pb"].notna() & (cross_section["pb"] > 0)
             bp_raw.loc[valid_pb] = 1.0 / cross_section.loc[valid_pb, "pb"]
 
-            # 控制变量：log(总市值)，以及可选行业哑变量。
-            log_market_cap = np.log(
-                cross_section["total_market_cap"].where(
-                    cross_section["total_market_cap"] > 0
-                )
-            ).rename("log_total_market_cap")
-            controls = log_market_cap.to_frame()
-
-            if neutralize_industry:
-                industry_dummies = pd.get_dummies(
-                    cross_section["industry"].fillna("unknown").astype(str),
-                    prefix="industry",
-                    drop_first=True,
-                    dtype=float,
-                )
-                controls = pd.concat([controls, industry_dummies], axis=1)
-
-            bp_neutral = neutralize_ols(
-                target=bp_raw,
-                controls=controls,
-                min_obs=min_cs_count,
+            # 统一调用公共市值行业中性化函数；此处只取残差，随后仍按
+            # 原 BP 流程执行 MAD 去极值和 Z-score 标准化。
+            industry = (
+                cross_section["industry"]
+                if neutralize_industry
+                else None
             )
-            factor = zscore(winsorize_mad(bp_neutral, k=winsor_k))
-            factor = factor.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            bp_neutral = neutralize_size_industry(
+                target=bp_raw,
+                market_cap=cross_section["total_market_cap"],
+                industry=industry,
+                min_obs=min_cs_count,
+                standardize_residual=False,
+                zscore_ddof=0,
+                show_progress=False,
+            )
+            factor = zscore(
+                winsorize_mad(bp_neutral, k=winsor_k),
+                ddof=0,
+                show_progress=False,
+            )
+            factor = factor.replace([np.inf, -np.inf], np.nan)
 
             result_parts.append(
                 pd.DataFrame(
@@ -302,7 +302,7 @@ FACTOR = {
         "min_cs_count": {
             "default": 30,
             "accepted_values": "正整数。",
-            "effect": "单日中性化回归所需最小有效样本数；不足时最终因子值填 0。",
+            "effect": "单日中性化回归所需最小有效样本数；不足时保留 NaN。",
             "changes_data_requirements": False,
         },
         "show_progress": {
@@ -325,7 +325,7 @@ FACTOR = {
         "preheating_required": False,
         "insufficient_window_behavior": "不适用；这是零历史窗口的当日截面因子。",
         "insufficient_cross_section_behavior": (
-            "有效样本数低于 min_cs_count 时，中性化结果的缺失值在最终输出中填为 0。"
+            "有效样本数不足以完成中性化时，对应因子值保留为 NaN。"
         ),
     },
     "output_schema": {
@@ -345,7 +345,7 @@ FACTOR = {
     "usage_notes": [
         "因子模块不读取任何数据源；加载器负责将实际字段映射为本元信息中的标准字段。",
         "适用于目标日可获得 PB、总市值及可选行业分类的股票截面。",
-        "策略应读取 direction=1，在同一市值组内优先选择因子值较高的股票。",
+        "direction=1 仅说明该因子的经验方向；具体选股排序由调用策略显式决定。",
     ],
     "pit_notes": [
         "pb、total_market_cap 与 industry 必须是目标日信号形成时真实可获得的点时数据。",
@@ -354,5 +354,5 @@ FACTOR = {
     ],
     "tags": ["valuation", "bp", "cross_sectional", "neutralized"],
     "status": "research",
-    "version": "1.1.0",
+    "version": "1.2.0",
 }

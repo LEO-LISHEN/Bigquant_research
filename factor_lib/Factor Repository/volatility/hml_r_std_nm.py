@@ -337,44 +337,36 @@ FACTOR = {
         "required": {
             "date": {
                 "dtype": "datetime64[ns] 或可解析日期",
-                "frequency": "daily",
                 "meaning": "日频观测日期及目标因子截面日期。",
             },
             "instrument": {
                 "dtype": "string",
-                "frequency": "daily",
                 "meaning": "证券唯一标识。",
             },
             "high": {
                 "dtype": "float",
-                "frequency": "daily",
                 "meaning": "与close使用相同复权口径的当日最高价。",
             },
             "low": {
                 "dtype": "float",
-                "frequency": "daily",
                 "meaning": "与close使用相同复权口径的当日最低价。",
             },
             "close": {
                 "dtype": "float",
-                "frequency": "daily",
                 "meaning": "收盘价；仅在pre_close无效时用于向后回退。",
             },
             "pre_close": {
                 "dtype": "float",
-                "frequency": "daily",
                 "meaning": "与high、low一致口径的前一交易日收盘价。",
             },
             "total_market_cap": {
                 "dtype": "float",
-                "frequency": "daily",
                 "meaning": "目标日总市值，中性化时取自然对数。",
             },
         },
         "conditional": {
             "industry": {
                 "dtype": "string",
-                "frequency": "daily",
                 "meaning": "目标日点时可得的一级行业分类。",
                 "required_when": {"neutralize_industry": True},
             },
@@ -508,5 +500,5 @@ FACTOR = {
         "parameterized_window",
     ],
     "status": "research",
-    "version": "1.0.0",
+    "version": "1.1.0",
 }
