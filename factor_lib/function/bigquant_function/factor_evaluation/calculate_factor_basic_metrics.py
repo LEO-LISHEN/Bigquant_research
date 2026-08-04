@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from collections.abc import Mapping
 
 import numpy as np
@@ -126,7 +127,50 @@ def _render_progress(
     )
 
 
-def _query_trading_calendar(end_date):
+def _run_with_stage_heartbeat(
+    action,
+    stage_number,
+    stage_total,
+    message,
+    started_at,
+    show_progress,
+    current=None,
+    interval_seconds=2.0,
+):
+    """外部阻塞任务运行时定时刷新阶段存活状态。"""
+    if not show_progress:
+        return action()
+
+    stop_event = threading.Event()
+
+    def heartbeat():
+        while not stop_event.wait(interval_seconds):
+            _render_progress(
+                stage_number,
+                stage_total,
+                f"{message}（仍在运行）",
+                started_at,
+                current=current,
+            )
+
+    worker = threading.Thread(
+        target=heartbeat,
+        name="factor-basic-metrics-progress",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return action()
+    finally:
+        stop_event.set()
+        worker.join(timeout=max(interval_seconds, 0.1))
+
+
+def _query_trading_calendar(
+    end_date,
+    show_progress=False,
+    started_at=None,
+):
     """读取截至截止日的完整A股交易日历，供预热和标签定位使用。"""
     try:
         import dai
@@ -141,7 +185,17 @@ def _query_trading_calendar(end_date):
     WHERE date <= '{end_date:%Y-%m-%d}'
     ORDER BY date
     """
-    calendar = dai.query(sql).df()
+    if started_at is None:
+        started_at = time.perf_counter()
+    calendar = _run_with_stage_heartbeat(
+        lambda: dai.query(sql).df(),
+        2,
+        8,
+        "读取A股交易日历",
+        started_at,
+        show_progress,
+        current=f"截止{end_date:%Y-%m-%d}",
+    )
     if calendar.empty or "date" not in calendar.columns:
         raise ValueError("未读取到有效的A股交易日历。")
 
@@ -287,6 +341,7 @@ def _resolve_factor_column(metadata, factor_name):
 def _prepare_forward_return_labels(
     schedule,
     instruments,
+    show_progress=False,
 ):
     price_dates = sorted(
         set(schedule["date"])
@@ -297,7 +352,7 @@ def _prepare_forward_return_labels(
         standard_fields=["close"],
         dates=price_dates,
         instruments=instruments,
-        show_progress=False,
+        show_progress=show_progress,
     )
     required = {"date", "instrument", "close"}
     missing = required - set(price_data.columns)
@@ -790,7 +845,11 @@ def calculate_factor_basic_metrics(
                 started_at,
             )
 
-        trading_calendar = _query_trading_calendar(end_date)
+        trading_calendar = _query_trading_calendar(
+            end_date,
+            show_progress=show_progress,
+            started_at=started_at,
+        )
         schedule = _build_evaluation_schedule(
             trading_calendar,
             start_date,
@@ -820,7 +879,7 @@ def calculate_factor_basic_metrics(
             dates=factor_dates,
             factor_params=resolved_factor_params,
             instruments=instruments,
-            show_progress=False,
+            show_progress=show_progress,
         )
         if show_progress:
             row_summary = ", ".join(
@@ -832,9 +891,10 @@ def calculate_factor_basic_metrics(
                 8,
                 "调用因子函数计算目标截面",
                 started_at,
-                completed=0,
-                total=len(target_dates),
-                current=f"{factor_name}；{row_summary}",
+                current=(
+                    f"{factor_name}；{len(target_dates)}个截面；"
+                    f"{row_summary}"
+                ),
             )
         factor_data = get_factor(
             factor_name,
@@ -842,7 +902,7 @@ def calculate_factor_basic_metrics(
             target_dates=target_dates,
             as_of_date=end_date,
             **resolved_factor_params,
-            show_progress=False,
+            show_progress=show_progress,
             progress_every=progress_every,
         )
         if show_progress:
@@ -867,6 +927,7 @@ def calculate_factor_basic_metrics(
         label_data = _prepare_forward_return_labels(
             schedule,
             instruments,
+            show_progress=show_progress,
         )
         if show_progress:
             _render_progress(

@@ -3,12 +3,26 @@
 
 本模块不查询数据，也不计算因子。它只负责把不同主键粒度的
 DataFrame 分开保存，并提供统一验证、按日期裁剪和读取接口。
+
+性能说明
+--------
+容器在创建时为每个包含 ``date`` 的数据域一次性建立日期索引：
+
+1. 日期已经连续排序时，缓存每个日期对应的行切片边界；
+2. 日期未排序时，缓存每个日期对应的整数行位置；
+3. ``missing_dates`` 直接读取缓存，不再扫描整个 DataFrame；
+4. ``select_dates`` 直接定位所需日期，不再对完整面板反复执行
+   ``panel["date"].isin(...)``。
+
+容器公开接口保持不变。为保证缓存有效，构造容器后应把其中的
+DataFrame 视为只读对象；如需替换数据域，请使用 ``with_domain``。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
+import numpy as np
 import pandas as pd
 
 
@@ -59,6 +73,20 @@ class FactorDataBundle:
 
         self._domains = normalized_domains
         self._key_columns = normalized_keys
+        self._build_date_indexes()
+
+    @classmethod
+    def _from_validated_domains(cls, domains, key_columns):
+        """由已验证面板建立容器，避免日期裁剪后重复做全量校验。
+
+        本方法仅供 ``select_dates`` 内部使用。裁剪结果来自已经通过
+        主键、日期和重复值检查的数据域，因此无需再次执行相同校验。
+        """
+        instance = cls.__new__(cls)
+        instance._domains = dict(domains)
+        instance._key_columns = dict(key_columns)
+        instance._build_date_indexes()
+        return instance
 
     @staticmethod
     def _normalize_domain_name(domain_name):
@@ -134,6 +162,148 @@ class FactorDataBundle:
             )
         return result
 
+    @staticmethod
+    def _normalize_dates(dates, allow_empty=False):
+        """将单日期或日期序列标准化为保持输入顺序的唯一日期索引。"""
+        if isinstance(dates, (str, pd.Timestamp, np.datetime64)):
+            dates = [dates]
+
+        try:
+            values = list(dates)
+        except TypeError as exc:
+            raise TypeError("dates必须是日期或日期序列。") from exc
+
+        normalized = pd.DatetimeIndex(
+            pd.to_datetime(values, errors="raise")
+        ).normalize().unique()
+        if not allow_empty and len(normalized) == 0:
+            raise ValueError("dates不能为空。")
+        return normalized
+
+    def _build_date_indexes(self):
+        """为所有日期型数据域建立一次性日期定位缓存。"""
+        self._available_dates = {}
+        self._date_indexes = {}
+
+        for domain_name, panel in self._domains.items():
+            if "date" not in panel.columns:
+                continue
+
+            if panel.empty:
+                self._available_dates[domain_name] = pd.DatetimeIndex([])
+                self._date_indexes[domain_name] = {
+                    "mode": "empty",
+                    "date_order": (),
+                    "locations": {},
+                }
+                continue
+
+            date_series = panel["date"]
+
+            # BigQuant适配器通常按date排序。此时每个日期对应连续行块，
+            # 只缓存(start, stop)即可，内存开销与交易日数量成正比。
+            if date_series.is_monotonic_increasing:
+                date_values = date_series.to_numpy(copy=False)
+                change_points = (
+                    np.flatnonzero(date_values[1:] != date_values[:-1]) + 1
+                )
+                starts = np.concatenate(
+                    (np.array([0], dtype=np.int64), change_points)
+                )
+                stops = np.concatenate(
+                    (change_points, np.array([len(panel)], dtype=np.int64))
+                )
+
+                date_order = tuple(
+                    pd.Timestamp(date_values[start]).normalize()
+                    for start in starts
+                )
+                locations = {
+                    date: (int(start), int(stop))
+                    for date, start, stop in zip(
+                        date_order,
+                        starts,
+                        stops,
+                    )
+                }
+                mode = "slices"
+
+            else:
+                # 自定义面板可能没有按日期排序。此时保存原始整数行位置，
+                # select_dates仍按照原DataFrame行顺序返回结果。
+                grouped_positions = date_series.groupby(
+                    date_series,
+                    sort=False,
+                ).indices
+                date_order = tuple(
+                    pd.Timestamp(date).normalize()
+                    for date in grouped_positions
+                )
+                locations = {
+                    pd.Timestamp(date).normalize(): np.asarray(
+                        positions,
+                        dtype=np.int64,
+                    )
+                    for date, positions in grouped_positions.items()
+                }
+                mode = "positions"
+
+            self._available_dates[domain_name] = pd.DatetimeIndex(
+                date_order
+            )
+            self._date_indexes[domain_name] = {
+                "mode": mode,
+                "date_order": date_order,
+                "locations": locations,
+            }
+
+    def _select_domain_dates(self, domain_name, selected_dates):
+        """使用缓存直接裁剪一个数据域，并保持原始行顺序。"""
+        panel = self._domains[domain_name]
+        cache = self._date_indexes[domain_name]
+        if cache["mode"] == "empty":
+            return panel.iloc[0:0].copy()
+
+        selected_set = set(selected_dates)
+        ordered_dates = [
+            date
+            for date in cache["date_order"]
+            if date in selected_set
+        ]
+        if not ordered_dates:
+            return panel.iloc[0:0].copy()
+
+        locations = cache["locations"]
+        if cache["mode"] == "slices":
+            bounds = [locations[date] for date in ordered_dates]
+
+            # 连续交易日窗口是策略最常见的请求。连续时只做一次iloc切片，
+            # 不创建数十万行的布尔掩码或整数位置数组。
+            is_contiguous = all(
+                previous_stop == current_start
+                for (_, previous_stop), (current_start, _) in zip(
+                    bounds,
+                    bounds[1:],
+                )
+            )
+            if is_contiguous:
+                return panel.iloc[bounds[0][0]:bounds[-1][1]].copy()
+
+            pieces = [
+                panel.iloc[start:stop]
+                for start, stop in bounds
+            ]
+            return pd.concat(
+                pieces,
+                axis=0,
+                copy=False,
+            ).copy()
+
+        position_parts = [locations[date] for date in ordered_dates]
+        positions = np.concatenate(position_parts)
+        positions.sort()
+        return panel.iloc[positions].copy()
+
     @property
     def domain_names(self):
         return tuple(self._domains)
@@ -164,38 +334,38 @@ class FactorDataBundle:
         }
 
     def missing_dates(self, domain_name, dates):
-        panel = self.get_domain(domain_name)
-        if isinstance(dates, (str, pd.Timestamp)):
-            dates = [dates]
-        required_dates = pd.DatetimeIndex(
-            pd.to_datetime(list(dates), errors="raise")
-        ).normalize().unique()
-        available_dates = pd.DatetimeIndex(
-            panel["date"].dropna().unique()
-        ).normalize()
-        return required_dates.difference(available_dates)
+        """返回指定数据域缺少的日期，不再扫描完整面板。"""
+        self.get_domain(domain_name)
+        if domain_name not in self._available_dates:
+            raise ValueError(
+                f"数据域 {domain_name!r} 不包含date字段，无法检查日期。"
+            )
+
+        required_dates = self._normalize_dates(
+            dates,
+            allow_empty=True,
+        )
+        return required_dates.difference(
+            self._available_dates[domain_name]
+        )
 
     def select_dates(self, dates):
-        """对所有含date字段的数据域使用同一日期集合进行裁剪。"""
-        if isinstance(dates, (str, pd.Timestamp)):
-            dates = [dates]
-        selected_dates = pd.DatetimeIndex(
-            pd.to_datetime(list(dates), errors="raise")
-        ).normalize().unique()
-        if len(selected_dates) == 0:
-            raise ValueError("dates不能为空。")
+        """对所有含date字段的数据域使用同一日期集合进行快速裁剪。"""
+        selected_dates = self._normalize_dates(dates)
 
-        selected_set = set(selected_dates)
         selected_domains = {}
         for domain_name, panel in self._domains.items():
             if "date" not in panel.columns:
                 selected_domains[domain_name] = panel
                 continue
-            selected_domains[domain_name] = panel.loc[
-                panel["date"].isin(selected_set)
-            ].copy()
+            selected_domains[domain_name] = self._select_domain_dates(
+                domain_name,
+                selected_dates,
+            )
 
-        return FactorDataBundle(
+        # 所有裁剪结果均来自已经验证的数据域，因此不重复执行日期解析、
+        # 主键空值检查和重复值扫描；新容器只为裁剪结果建立轻量日期索引。
+        return self._from_validated_domains(
             selected_domains,
             key_columns=self._key_columns,
         )

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 import time
+import threading
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from typing import Callable, Optional
@@ -641,6 +642,46 @@ def _render_progress(
     print(message.ljust(180), end="", flush=True)
 
 
+def _run_with_query_heartbeat(
+    action,
+    completed,
+    total,
+    table,
+    started_at,
+    detail,
+    show_progress,
+    interval_seconds=2.0,
+):
+    """单张财务表查询阻塞期间刷新存活状态，不伪造查询百分比。"""
+    if not show_progress:
+        return action()
+
+    stop_event = threading.Event()
+
+    def heartbeat():
+        while not stop_event.wait(interval_seconds):
+            _render_progress(
+                completed=completed,
+                total=total,
+                table=table,
+                started_at=started_at,
+                stage=f"正在查询 {table}",
+                detail=f"{detail}，查询仍在运行",
+            )
+
+    worker = threading.Thread(
+        target=heartbeat,
+        name="bigquant-financial-query-progress",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return action()
+    finally:
+        stop_event.set()
+        worker.join(timeout=max(interval_seconds, 0.1))
+
+
 def load_financial_raw_data(
     standard_fields,
     start_date=None,
@@ -707,20 +748,31 @@ def load_financial_raw_data(
                 instruments=instruments,
             )
 
-            if query_func is None:
-                query_result = _default_query(
-                    sql,
-                    filters=partition_filters,
-                )
-            else:
-                query_result = _call_query_func(
-                    query_func,
-                    sql,
-                    partition_filters,
-                )
+            def execute_and_convert():
+                if query_func is None:
+                    query_result = _default_query(
+                        sql,
+                        filters=partition_filters,
+                    )
+                else:
+                    query_result = _call_query_func(
+                        query_func,
+                        sql,
+                        partition_filters,
+                    )
+                return _to_dataframe(query_result)
 
+            raw_result = _run_with_query_heartbeat(
+                execute_and_convert,
+                completed=index - 1,
+                total=total_tables,
+                table=table,
+                started_at=started_at,
+                detail=f"{len(table_fields)} 个字段",
+                show_progress=show_progress,
+            )
             panel = _validate_table_result(
-                _to_dataframe(query_result),
+                raw_result,
                 table=table,
                 fields=table_fields,
             )

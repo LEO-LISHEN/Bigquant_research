@@ -286,82 +286,24 @@ def calc_return_nm(
 
 
 FACTOR = {
-    "name": "return_nm",
+    "name": 'return_nm',
     "func": calc_return_nm,
-    "category": "momentum",
-    "direction": -1,
-    "description": (
-        "最近 N 个月后复权收盘价区间收益；"
-        "原华泰研究中因子值越低越好。"
-    ),
-    "formula": (
-        "L=n_months*trading_days_per_month；"
-        "factor_t=close_t/close_{t-L}-1。"
-    ),
     "input_schema": {
         "required": {
-            "date": {
-                "dtype": "datetime64[ns] 或可解析日期",
-                "meaning": "日频观测日期及目标因子截面日期。",
-            },
-            "instrument": {
-                "dtype": "string",
-                "meaning": (
-                    "证券唯一标识；同一 date + instrument "
-                    "不允许重复。"
-                ),
-            },
-            "close": {
-                "dtype": "float",
-                "meaning": (
-                    "与因子定义一致的复权收盘价；"
-                    "整个回看窗口必须使用同一复权口径。"
-                ),
-            },
+            'date': {},
+            'instrument': {},
+            'close': {},
         },
-        "conditional": {},
+        "conditional": {
+        },
     },
     "parameters": {
-        "target_dates": {
-            "default": None,
-            "accepted_values": "单个日期或日期序列。",
-            "effect": (
-                "指定实际输出截面；None 表示输出 data 中全部日期。"
-            ),
-            "changes_data_requirements": True,
-        },
-        "as_of_date": {
-            "default": None,
-            "accepted_values": "可解析日期或 None。",
-            "effect": "全局信息截止日，晚于该日的数据不参与计算。",
-            "changes_data_requirements": False,
-        },
-        "n_months": {
-            "default": 1,
-            "accepted_values": "正整数。",
-            "effect": "改变区间收益的回看长度。",
-            "changes_data_requirements": True,
-        },
-        "trading_days_per_month": {
-            "default": 21,
-            "accepted_values": "正整数。",
-            "effect": (
-                "将月份换算为交易日；改变实际回看交易日数。"
-            ),
-            "changes_data_requirements": True,
-        },
-        "show_progress": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "仅控制进度显示，不改变计算结果。",
-            "changes_data_requirements": False,
-        },
-        "progress_every": {
-            "default": 200,
-            "accepted_values": "正整数。",
-            "effect": "进度刷新间隔，单位为股票数。",
-            "changes_data_requirements": False,
-        },
+        'target_dates': {"default": None},
+        'as_of_date': {"default": None},
+        'n_months': {"default": 1},
+        'trading_days_per_month': {"default": 21},
+        'show_progress': {"default": False},
+        'progress_every': {"default": 200},
     },
     "data_window": {
         "resolver": _resolve_return_nm_data_window,
@@ -370,69 +312,22 @@ FACTOR = {
             "requires_target_date_data": True,
             "minimum_history_observations": 21,
             "preheating_required": True,
-            "insufficient_window_behavior": (
-                "单只股票在目标日前不足 21 个历史交易日时，"
-                "该股票目标日因子值输出 NaN。"
-            ),
         },
-        "resolver_notes": (
-            "实际窗口由 n_months * trading_days_per_month 决定；"
-            "loader 必须使用本次 resolved_factor_params 调用 resolver。"
-        ),
     },
     "output_schema": {
-        "date": {
-            "dtype": "datetime64[ns]",
-            "meaning": "目标因子截面日期。",
-        },
-        "instrument": {
-            "dtype": "string",
-            "meaning": "证券唯一标识。",
-        },
-        "return_nm": {
-            "dtype": "float64",
-            "meaning": (
-                "N 月区间收益；数值越低，"
-                "按原华泰研究定义越优。"
-            ),
-        },
+        'date': {},
+        'instrument': {},
+        'return_nm': {},
     },
-    "usage_notes": [
-        "n_months=1 对应原始 return_1m。",
-        "因子层不负责市值分组、行业剔除、ST/停牌过滤或选股。",
-        (
-            "策略和研究层应剔除 NaN 因子值；"
-            "不应将预热不足的结果填为 0。"
-        ),
-    ],
-    "best_practice": {
-        "instance_name": "return_1m",
-        "parameters": {
-            "n_months": 1,
-            "trading_days_per_month": 21,
-        },
-        "description": (
-            "当前最佳实践实例为 1 个月区间收益因子。"
-        ),
-    },
-    "pit_notes": [
-        "只使用目标日及以前的 close，不使用任何未来行情。",
-        (
-            "若使用目标日收盘价形成信号，最早应在下一可交易时点执行。"
-        ),
-        (
-            "不同数据源的复权方式可能不同；迁移和结果对照时必须"
-            "保持相同的价格复权口径。"
-        ),
-    ],
-    "references": [
-        "华泰动量类因子研究：return_1m 定义。",
-    ],
-    "tags": [
-        "momentum",
-        "interval_return",
-        "parameterized_window",
-    ],
-    "status": "research",
-    "version": "1.1.0",
 }
+
+
+FACTOR_INFO = """
+# 区间收益（N 月）
+
+计算近 N 个月复权收盘价的区间收益，保留原研究中的排序口径：数值较低通常更优。
+
+- **计算**：收益 = 目标日收盘价 / 窗口起点收盘价 - 1。
+- **时点**：整个窗口必须使用一致的复权价格口径，且不使用未来行情。
+- **推荐实例**：`n_months=1`，即原 1 个月版本。
+"""

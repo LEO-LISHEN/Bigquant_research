@@ -236,123 +236,48 @@ def calc_book_to_price(
 
 
 FACTOR = {
-    "name": "book_to_price",
+    "name": 'book_to_price',
     "func": calc_book_to_price,
-    "category": "valuation",
-    "direction": 1,
-    "description": "BP=1/PB；经市值和可选行业中性化、MAD 去极值及 Z-score 标准化。",
-    "formula": (
-        "raw_bp = 1 / pb（仅 pb > 0）；对 raw_bp 关于 log(total_market_cap) "
-        "及可选行业哑变量进行截面 OLS 中性化，再做 MAD 去极值与 Z-score 标准化。"
-    ),
     "input_schema": {
         "required": {
-            "date": {
-                "dtype": "datetime64[ns] 或可解析日期",
-                "meaning": "观测/信号截面日期。",
-            },
-            "instrument": {
-                "dtype": "string",
-                "meaning": "证券唯一标识；同一 date + instrument 不允许重复。",
-            },
-            "pb": {
-                "dtype": "float",
-                "meaning": "市净率（Price-to-Book）。仅正值参与 BP 原始值计算。",
-            },
-            "total_market_cap": {
-                "dtype": "float",
-                "meaning": "当日总市值；正值取自然对数后用于市值中性化。",
-            },
+            'date': {},
+            'instrument': {},
+            'pb': {},
+            'total_market_cap': {},
         },
         "conditional": {
-            "industry": {
-                "dtype": "string 或分类变量",
-                "meaning": "当日行业分类，用于构造行业哑变量。",
-                "required_when": {"neutralize_industry": True},
-                "default_behavior_when_missing": "仅在未启用行业中性化时允许不提供。",
-            },
+            'industry': {"required_when": {'neutralize_industry': True}},
         },
     },
     "parameters": {
-        "target_dates": {
-            "default": None,
-            "accepted_values": "单个日期或可迭代日期对象。",
-            "effect": "指定实际输出的因子截面；None 表示计算 data 中全部日期。",
-            "changes_data_requirements": True,
-        },
-        "as_of_date": {
-            "default": None,
-            "accepted_values": "可解析日期或 None。",
-            "effect": "全局信息截止日；晚于该日的数据一律不参与计算。",
-            "changes_data_requirements": False,
-        },
-        "neutralize_industry": {
-            "default": True,
-            "accepted_values": [True, False],
-            "effect": "控制是否在市值中性化基础上增加行业中性化。",
-            "changes_data_requirements": True,
-            "additional_required_fields_when_true": ["industry"],
-        },
-        "winsor_k": {
-            "default": 5.0,
-            "accepted_values": "大于 0 的 float。",
-            "effect": "MAD 去极值的阈值倍数；值越小，极值处理越严格。",
-            "changes_data_requirements": False,
-        },
-        "min_cs_count": {
-            "default": 30,
-            "accepted_values": "正整数。",
-            "effect": "单日中性化回归所需最小有效样本数；不足时保留 NaN。",
-            "changes_data_requirements": False,
-        },
-        "show_progress": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "仅控制终端进度显示，不改变计算结果。",
-            "changes_data_requirements": False,
-        },
-        "progress_every": {
-            "default": 20,
-            "accepted_values": "正整数。",
-            "effect": "进度刷新间隔（按目标截面计）。",
-            "changes_data_requirements": False,
-        },
+        'target_dates': {"default": None},
+        'as_of_date': {"default": None},
+        'neutralize_industry': {"default": True},
+        'winsor_k': {"default": 5.0},
+        'min_cs_count': {"default": 30},
+        'show_progress': {"default": False},
+        'progress_every': {"default": 20},
     },
     "data_window": {
         "lookback_trading_days": 0,
         "requires_target_date_data": True,
         "minimum_history_observations": 0,
         "preheating_required": False,
-        "insufficient_window_behavior": "不适用；这是零历史窗口的当日截面因子。",
-        "insufficient_cross_section_behavior": (
-            "有效样本数不足以完成中性化时，对应因子值保留为 NaN。"
-        ),
     },
     "output_schema": {
-        "date": {
-            "dtype": "datetime64[ns]",
-            "meaning": "目标因子截面日期。",
-        },
-        "instrument": {
-            "dtype": "string",
-            "meaning": "证券唯一标识。",
-        },
-        "book_to_price": {
-            "dtype": "float64",
-            "meaning": "标准化 BP 暴露；数值越大代表相对估值越低。",
-        },
+        'date': {},
+        'instrument': {},
+        'book_to_price': {},
     },
-    "usage_notes": [
-        "因子模块不读取任何数据源；加载器负责将实际字段映射为本元信息中的标准字段。",
-        "适用于目标日可获得 PB、总市值及可选行业分类的股票截面。",
-        "direction=1 仅说明该因子的经验方向；具体选股排序由调用策略显式决定。",
-    ],
-    "pit_notes": [
-        "pb、total_market_cap 与 industry 必须是目标日信号形成时真实可获得的点时数据。",
-        "财务类 PB 的底层口径必须避免使用目标日后才发布或修订的信息。",
-        "该因子仅使用目标日截面，不使用未来数据；策略如在收盘后形成信号，应在下一可交易时点执行。",
-    ],
-    "tags": ["valuation", "bp", "cross_sectional", "neutralized"],
-    "status": "research",
-    "version": "1.2.0",
 }
+
+
+FACTOR_INFO = """
+# BP（账面市值比）
+
+以 PB 的倒数刻画相对估值。经市值中性化，并可选择行业中性化后进行去极值和标准化；数值较高通常对应相对低估。
+
+- **计算**：BP = 1 / PB，仅保留正 PB。
+- **时点**：PB、市值和行业必须为信号日当时可得数据；收盘信息形成的信号应在下一可交易时点执行。
+- **研究提示**：宜与质量、成长等因子联合检验，不将其视为绝对估值结论。
+"""

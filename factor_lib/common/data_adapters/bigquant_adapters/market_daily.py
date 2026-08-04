@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import time
+import threading
 from collections.abc import Iterable
 from typing import Callable, Optional
 
@@ -285,6 +286,41 @@ def _render_progress(stage, started_at, detail=""):
     print(message.ljust(180), end="", flush=True)
 
 
+def _run_with_query_heartbeat(
+    action,
+    stage,
+    started_at,
+    detail,
+    show_progress,
+    interval_seconds=2.0,
+):
+    """市场指数查询阻塞期间刷新存活状态，不伪造查询百分比。"""
+    if not show_progress:
+        return action()
+
+    stop_event = threading.Event()
+
+    def heartbeat():
+        while not stop_event.wait(interval_seconds):
+            _render_progress(
+                stage,
+                started_at,
+                detail=f"{detail}，查询仍在运行",
+            )
+
+    worker = threading.Thread(
+        target=heartbeat,
+        name="bigquant-market-daily-query-progress",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return action()
+    finally:
+        stop_event.set()
+        worker.join(timeout=max(interval_seconds, 0.1))
+
+
 def load_market_daily_raw_data(
     standard_fields,
     market_index,
@@ -325,17 +361,24 @@ def load_market_daily_raw_data(
         )
 
     try:
-        if query_func is None:
-            query_result = _default_query(sql, filters)
-        else:
-            query_result = _call_query_func(query_func, sql, filters)
-        if show_progress:
-            _render_progress(
-                "[2/3] 转换并校验查询结果",
-                started_at,
-                detail=f"指数 {','.join(market_indices)}",
-            )
-        result = _to_dataframe(query_result).copy()
+        query_detail = f"指数 {','.join(market_indices)}"
+
+        def execute_and_convert():
+            if query_func is None:
+                query_result = _default_query(sql, filters)
+            else:
+                query_result = _call_query_func(
+                    query_func, sql, filters
+                )
+            return _to_dataframe(query_result).copy()
+
+        result = _run_with_query_heartbeat(
+            execute_and_convert,
+            "[2/3] 执行并接收市场指数查询",
+            started_at,
+            query_detail,
+            show_progress,
+        )
 
         expected_source_columns = {
             "date",

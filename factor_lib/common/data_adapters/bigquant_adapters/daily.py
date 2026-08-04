@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from collections.abc import Iterable
 from typing import Callable, Optional
 
@@ -436,6 +437,41 @@ def _render_progress(stage, started_at, completed=None, total=None, detail=""):
     print("\r" + " | ".join(parts).ljust(180), end="", flush=True)
 
 
+def _run_with_query_heartbeat(
+    action,
+    stage,
+    started_at,
+    detail,
+    show_progress,
+    interval_seconds=2.0,
+):
+    """阻塞查询期间定时刷新存活状态；不伪造服务器端百分比。"""
+    if not show_progress:
+        return action()
+
+    stop_event = threading.Event()
+
+    def heartbeat():
+        while not stop_event.wait(interval_seconds):
+            _render_progress(
+                stage,
+                started_at,
+                detail=f"{detail}，查询仍在运行",
+            )
+
+    worker = threading.Thread(
+        target=heartbeat,
+        name="bigquant-daily-query-progress",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return action()
+    finally:
+        stop_event.set()
+        worker.join(timeout=max(interval_seconds, 0.1))
+
+
 def load_daily_raw_data(
     standard_fields,
     start_date=None,
@@ -500,60 +536,64 @@ def load_daily_raw_data(
             f"（{date_selector['dates'][0]} 至 "
             f"{date_selector['dates'][-1]}）"
         )
-    if show_progress:
-        _render_progress(
-            "[1/3] 提交日频查询",
+    try:
+        if show_progress:
+            _render_progress(
+                "[1/3] 准备日频查询",
+                started_at,
+                detail=f"{date_summary}，{len(fields)} 个字段",
+            )
+
+        def execute_and_convert():
+            if query_func is None:
+                query_result = _default_query(
+                    sql,
+                    filters=partition_filters,
+                )
+            else:
+                # 自定义查询函数主要用于本地测试。
+                query_result = query_func(sql)
+            return (
+                query_result.df()
+                if hasattr(query_result, "df")
+                else query_result
+            )
+
+        result = _run_with_query_heartbeat(
+            execute_and_convert,
+            "[2/3] 执行并接收日频查询",
             started_at,
-            detail=f"{date_summary}，{len(fields)} 个字段",
+            date_summary,
+            show_progress,
         )
+        if not isinstance(result, pd.DataFrame):
+            raise TypeError(
+                "query_func 必须返回 pandas.DataFrame "
+                "或具有 .df() 的查询结果。"
+            )
 
-    if query_func is None:
-        query_result = _default_query(
-            sql,
-            filters=partition_filters,
+        expected_columns = ["date", "instrument", *fields]
+        missing_columns = sorted(
+            set(expected_columns) - set(result.columns)
         )
-    else:
-        # 自定义查询函数主要用于本地测试，保持原有单参数接口兼容。
-        query_result = query_func(sql)
+        if missing_columns:
+            raise ValueError(
+                "BigQuant 查询结果缺少预期字段："
+                f"{missing_columns}。请检查字段映射和数据表权限。"
+            )
 
-    if show_progress:
-        _render_progress(
-            "[2/3] 将查询结果转换为 DataFrame",
-            started_at,
-            detail=date_summary,
-        )
-    result = (
-        query_result.df()
-        if hasattr(query_result, "df")
-        else query_result
-    )
-    if not isinstance(result, pd.DataFrame):
-        raise TypeError(
-            "query_func 必须返回 pandas.DataFrame "
-            "或具有 .df() 的查询结果。"
-        )
+        # 按请求顺序返回；这只是字段投影，不改变原始字段值或行记录。
+        result = result.loc[:, expected_columns]
 
-    expected_columns = ["date", "instrument", *fields]
-    missing_columns = sorted(
-        set(expected_columns) - set(result.columns)
-    )
-    if missing_columns:
-        raise ValueError(
-            "BigQuant 查询结果缺少预期字段："
-            f"{missing_columns}。请检查字段映射和数据表权限。"
-        )
-
-    # 按请求顺序返回；这只是字段投影，不改变原始字段值或行记录。
-    result = result.loc[:, expected_columns]
-
-    if show_progress:
-        _render_progress(
-            "[3/3] 查询结果校验完成",
-            started_at,
-            completed=1,
-            total=1,
-            detail=f"{len(result):,} 行",
-        )
-        print()
-
-    return result
+        if show_progress:
+            _render_progress(
+                "[3/3] 查询结果校验完成",
+                started_at,
+                completed=1,
+                total=1,
+                detail=f"{len(result):,} 行",
+            )
+        return result
+    finally:
+        if show_progress:
+            print()

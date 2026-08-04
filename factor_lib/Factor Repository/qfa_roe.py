@@ -340,154 +340,49 @@ def calc_qfa_roe(
 
 
 FACTOR = {
-    "name": "qfa_roe",
+    "name": 'qfa_roe',
     "func": calc_qfa_roe,
-    "category": "quality",
-    "direction": 1,
-    "description": (
-        "单季度平均净资产收益率质量因子，经截面稳健标准化、"
-        "流通市值和可选行业中性化，并对残差再次稳健标准化；"
-        "数值越高代表盈利质量越高。"
-    ),
-    "formula": (
-        "raw_t=quarterly_average_roe_t="
-        "quarterly_parent_net_profit_t/average_parent_equity_t；"
-        "raw先执行median±winsor_k×MAD去极值和总体Z-score；"
-        "随后对log(float_market_cap)和可选行业哑变量做截面OLS；"
-        "最终因子为OLS残差再次MAD去极值后的总体Z-score。"
-    ),
     "input_schema": {
         "required": {
-            "date": {
-                "dtype": "datetime64[ns]或可解析日期",
-                "meaning": "点时财务因子截面日期。",
-            },
-            "instrument": {
-                "dtype": "string",
-                "meaning": "证券唯一标识；同一date+instrument不允许重复。",
-            },
-            "quarterly_average_roe": {
-                "dtype": "float",
-                "meaning": (
-                    "截至目标日最新可得的单季度平均净资产收益率；"
-                    "对应BigQuant的roe_avg_mrq口径，但字段名保持数据源无关。"
-                ),
-            },
-            "float_market_cap": {
-                "dtype": "float",
-                "meaning": "目标日流通市值；取自然对数后用于中性化。",
-            },
+            'date': {},
+            'instrument': {},
+            'quarterly_average_roe': {},
+            'float_market_cap': {},
         },
         "conditional": {
-            "industry": {
-                "dtype": "string",
-                "meaning": "目标日点时一级行业分类。",
-                "required_when": {"neutralize_industry": True},
-            },
+            'industry': {"required_when": {'neutralize_industry': True}},
         },
     },
     "parameters": {
-        "target_dates": {
-            "default": None,
-            "accepted_values": "单个日期、日期序列或None。",
-            "effect": "指定实际输出的因子截面。",
-            "changes_data_requirements": True,
-        },
-        "as_of_date": {
-            "default": None,
-            "accepted_values": "可解析日期或None。",
-            "effect": "全局信息截止日，晚于该日的数据不参与计算。",
-            "changes_data_requirements": False,
-        },
-        "neutralize_industry": {
-            "default": True,
-            "accepted_values": [True, False],
-            "effect": "控制是否在流通市值之外加入行业哑变量。",
-            "changes_data_requirements": True,
-        },
-        "winsor_k": {
-            "default": 5.0,
-            "accepted_values": "有限正数。",
-            "effect": "控制原始因子和中性化残差的MAD去极值边界。",
-            "changes_data_requirements": False,
-        },
-        "min_cs_count": {
-            "default": 30,
-            "accepted_values": "大于等于3的整数。",
-            "effect": "控制单日截面中性化的最低有效样本数。",
-            "changes_data_requirements": False,
-        },
-        "min_industry_count": {
-            "default": 10,
-            "accepted_values": "正整数。",
-            "effect": "样本数不足的行业合并为OTHER，降低哑变量稀疏度。",
-            "changes_data_requirements": False,
-        },
-        "show_progress": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "仅控制进度显示。",
-            "changes_data_requirements": False,
-        },
-        "progress_every": {
-            "default": 20,
-            "accepted_values": "正整数。",
-            "effect": "进度刷新间隔，单位为目标截面数。",
-            "changes_data_requirements": False,
-        },
+        'target_dates': {"default": None},
+        'as_of_date': {"default": None},
+        'neutralize_industry': {"default": True},
+        'winsor_k': {"default": 5.0},
+        'min_cs_count': {"default": 30},
+        'min_industry_count': {"default": 10},
+        'show_progress': {"default": False},
+        'progress_every': {"default": 20},
     },
     "data_window": {
         "lookback_trading_days": 0,
         "requires_target_date_data": True,
         "minimum_history_observations": 0,
         "preheating_required": False,
-        "insufficient_window_behavior": (
-            "直接使用目标日已经点时对齐的单季度平均ROE；"
-            "目标日整体缺失时报错，个股缺失或截面不足时保留NaN。"
-        ),
     },
     "output_schema": {
-        "date": {
-            "dtype": "datetime64[ns]",
-            "meaning": "目标因子截面日期。",
-        },
-        "instrument": {
-            "dtype": "string",
-            "meaning": "证券唯一标识。",
-        },
-        "qfa_roe": {
-            "dtype": "float64",
-            "meaning": "市值行业中性化后的质量因子；数值越高越优。",
-        },
+        'date': {},
+        'instrument': {},
+        'qfa_roe': {},
     },
-    "usage_notes": [
-        "默认使用流通市值而不是总市值，以保持原notebook中性化口径。",
-        "小行业会按目标日截面合并为OTHER。",
-        "行业哑变量导致自由度不足时，按原notebook逻辑回退为仅流通市值中性化。",
-        "研究和策略层应剔除NaN因子值，不应填充为0。",
-    ],
-    "pit_notes": [
-        "quarterly_average_roe必须是目标日已经可得的点时财务指标。",
-        "不能按报告期结束日提前回填尚未公告的财报。",
-        "行业分类和流通市值也必须使用目标日点时值。",
-        (
-            "若数据源以最新更正后的财报覆盖历史版本，"
-            "仍可能存在历史修订数据偏差。"
-        ),
-    ],
-    "references": [
-        (
-            "研究稿/华泰因子复现/华泰财务质量因子/"
-            "qfa_roe因子/qfa_roe.ipynb"
-        ),
-    ],
-    "tags": [
-        "quality",
-        "roe",
-        "quarterly",
-        "neutralized",
-        "cross_sectional",
-    ],
-    "status": "research",
-    "version": "1.0.0",
 }
+
+
+FACTOR_INFO = """
+# QFA_ROE（单季平均净资产收益率）
+
+使用目标日可得的单季平均 ROE，经市值中性化、可选行业中性化、去极值和标准化后形成质量暴露。数值越高通常代表盈利质量更强。
+
+- **计算**：以点时财务字段 `quarterly_average_roe` 为原始输入。
+- **时点**：财务字段必须按真实披露可得时间对齐。
+- **研究提示**：ROE 可能受杠杆和一次性损益影响，宜配合利润与现金流指标判断。
+"""

@@ -526,7 +526,9 @@ def load_factor_raw_data(
                 "end_date": end_date,
                 "dates": dates,
                 "instruments": instruments,
-                "show_progress": False,
+                # loader 负责把外层进度开关传给当前实际工作的适配器；
+                # 各适配器只在自己的查询阶段占用单行输出。
+                "show_progress": show_progress,
             }
             for parameter_name in spec.get("context_parameters", ()):
                 value = resolved_params.get(parameter_name)

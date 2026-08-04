@@ -410,132 +410,35 @@ def calc_id1_std_nm(
 
 
 FACTOR = {
-    "name": "id1_std_nm",
+    "name": 'id1_std_nm',
     "func": calc_id1_std_nm,
-    "category": "volatility",
-    "direction": -1,
-    "description": (
-        "个股N个月日收益对市场日收益做滚动CAPM回归后的残差标准误，"
-        "再进行市值行业中性化；数值越低通常越优。"
-    ),
-    "formula": (
-        "L=n_months*trading_days_per_month；r_i=alpha+beta*r_m+epsilon；"
-        "raw=sqrt(SSE/(n-2))；最终对log(total_market_cap)和行业哑变量"
-        "做截面回归，默认输出残差样本Z-score。"
-    ),
     "input_schema": {
         "required": {
-            "date": {
-                "dtype": "datetime64[ns] 或可解析日期",
-                "meaning": "日频观测日期及目标因子截面日期。",
-            },
-            "instrument": {
-                "dtype": "string",
-                "meaning": "证券唯一标识。",
-            },
-            "close": {
-                "dtype": "float",
-                "meaning": "复权口径一致的股票日收盘价。",
-            },
-            "volume": {
-                "dtype": "float",
-                "meaning": "成交量；无成交日不参与时间序列回归。",
-            },
-            "amount": {
-                "dtype": "float",
-                "meaning": "成交额；无成交日不参与时间序列回归。",
-            },
-            "suspended": {
-                "dtype": "int/bool",
-                "meaning": "历史停牌状态；停牌日不参与回归。",
-            },
-            "total_market_cap": {
-                "dtype": "float",
-                "meaning": "目标日总市值，中性化时取自然对数。",
-            },
-            "market_close": {
-                "dtype": "float",
-                "meaning": (
-                    "market_index 参数指定的市场代理指数原始日收盘点位；"
-                    "因子内部计算日收益率。"
-                ),
-            },
+            'date': {},
+            'instrument': {},
+            'close': {},
+            'volume': {},
+            'amount': {},
+            'suspended': {},
+            'total_market_cap': {},
+            'market_close': {},
         },
         "conditional": {
-            "industry": {
-                "dtype": "string",
-                "meaning": "目标日点时可得的一级行业分类。",
-                "required_when": {"neutralize_industry": True},
-            },
+            'industry': {"required_when": {'neutralize_industry': True}},
         },
     },
     "parameters": {
-        "target_dates": {
-            "default": None,
-            "accepted_values": "单个日期、日期序列或None。",
-            "effect": "指定实际输出因子截面。",
-            "changes_data_requirements": True,
-        },
-        "as_of_date": {
-            "default": None,
-            "accepted_values": "可解析日期或None。",
-            "effect": "截断晚于信息截止日的数据。",
-            "changes_data_requirements": False,
-        },
-        "n_months": {
-            "default": 3,
-            "accepted_values": "正整数。",
-            "effect": "决定CAPM滚动回归的月份窗口。",
-            "changes_data_requirements": True,
-        },
-        "trading_days_per_month": {
-            "default": 21,
-            "accepted_values": "正整数。",
-            "effect": "将月份换算成交易日。",
-            "changes_data_requirements": True,
-        },
-        "market_index": {
-            "default": "csi_all_share",
-            "accepted_values": "数据适配层支持的统一市场指数名称。",
-            "effect": "指定CAPM回归使用的市场代理指数。",
-            "changes_data_requirements": True,
-        },
-        "min_ts_observations": {
-            "default": 50,
-            "accepted_values": "3至回归窗口长度之间的整数。",
-            "effect": "单只股票滚动回归的最少有效配对观测数。",
-            "changes_data_requirements": False,
-        },
-        "neutralize_industry": {
-            "default": True,
-            "accepted_values": [True, False],
-            "effect": "True为市值+行业中性化；False仅做市值中性化。",
-            "changes_data_requirements": True,
-        },
-        "min_cs_count": {
-            "default": 80,
-            "accepted_values": "正整数。",
-            "effect": "目标日中性化的最少有效股票数。",
-            "changes_data_requirements": False,
-        },
-        "standardize_residual": {
-            "default": True,
-            "accepted_values": [True, False],
-            "effect": "是否把市值行业中性化残差继续做样本Z-score。",
-            "changes_data_requirements": False,
-        },
-        "show_progress": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "只控制进度显示，不改变计算结果。",
-            "changes_data_requirements": False,
-        },
-        "progress_every": {
-            "default": 20,
-            "accepted_values": "正整数。",
-            "effect": "进度刷新间隔，单位为目标截面数。",
-            "changes_data_requirements": False,
-        },
+        'target_dates': {"default": None},
+        'as_of_date': {"default": None},
+        'n_months': {"default": 3},
+        'trading_days_per_month': {"default": 21},
+        'market_index': {"default": 'csi_all_share'},
+        'min_ts_observations': {"default": 50},
+        'neutralize_industry': {"default": True},
+        'min_cs_count': {"default": 80},
+        'standardize_residual': {"default": True},
+        'show_progress': {"default": False},
+        'progress_every': {"default": 20},
     },
     "data_window": {
         "resolver": _resolve_id1_std_nm_data_window,
@@ -544,59 +447,22 @@ FACTOR = {
             "requires_target_date_data": True,
             "minimum_history_observations": 63,
             "preheating_required": True,
-            "insufficient_window_behavior": (
-                "默认63日回归窗口，有效配对观测不足50日时输出NaN。"
-            ),
         },
-        "resolver_notes": (
-            "计算L个日收益需要目标日前至少L个交易日价格，因此预热为L日。"
-        ),
     },
     "output_schema": {
-        "date": {"dtype": "datetime64[ns]", "meaning": "目标截面日期。"},
-        "instrument": {"dtype": "string", "meaning": "证券唯一标识。"},
-        "id1_std_nm": {
-            "dtype": "float64",
-            "meaning": "市值行业中性化后的单市场因子特质波动率。",
-        },
+        'date': {},
+        'instrument': {},
+        'id1_std_nm': {},
     },
-    "usage_notes": [
-        "n_months=3、trading_days_per_month=21对应原id1_std_3m。",
-        "默认market_index='csi_all_share'，对应原Notebook的中证全指。",
-        "market_close由适配器独立加载，不会广播到每只股票行。",
-        "市场收益率只在因子内部由原始指数收盘点位计算。",
-        "因子层只把停牌和无成交日排除出波动率估计，不负责策略股票池过滤。",
-        "中性化股票池会影响结果，跨研究比较时必须保持一致。",
-    ],
-    "best_practice": {
-        "instance_name": "id1_std_3m",
-        "parameters": {
-            "n_months": 3,
-            "trading_days_per_month": 21,
-            "market_index": "csi_all_share",
-            "min_ts_observations": 50,
-            "neutralize_industry": True,
-            "min_cs_count": 80,
-            "standardize_residual": True,
-        },
-        "description": (
-            "3个月CAPM特质波动率，并按本次迁移要求加入市值行业中性化。"
-        ),
-    },
-    "pit_notes": [
-        "股票收益和由market_close计算的市场收益只使用目标日及以前数据。",
-        "市场指数、行业、停牌状态和总市值必须按历史日期提供。",
-        "目标日收盘价参与计算，因此信号最早在目标日收盘后形成。",
-    ],
-    "references": ["Bigquant_research：id1_std_3m因子.ipynb。"],
-    "tags": [
-        "volatility",
-        "idiosyncratic_volatility",
-        "capm",
-        "size_neutralized",
-        "industry_neutralized",
-        "parameterized_window",
-    ],
-    "status": "research",
-    "version": "2.0.0",
 }
+
+
+FACTOR_INFO = """
+# 单因子特质波动率（N 月）
+
+以个股收益对市场收益进行滚动 CAPM 回归，将残差波动率作为原始因子，再进行市值与可选行业中性化。数值较低通常代表较低的特质风险。
+
+- **计算**：市场指数由 `market_index` 参数指定，窗口随 `n_months` 变化。
+- **时点**：股票行情、市场指数、停牌状态、市值和行业均须按历史日期对齐。
+- **推荐实例**：`n_months=3`、`market_index='csi_all_share'`。
+"""

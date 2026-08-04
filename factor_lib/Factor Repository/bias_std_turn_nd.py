@@ -464,143 +464,31 @@ def calc_bias_std_turn_nd(
 
 
 FACTOR = {
-    "name": "bias_std_turn_nd",
+    "name": 'bias_std_turn_nd',
     "func": calc_bias_std_turn_nd,
-    "category": "turnover",
-    "direction": -1,
-    "description": (
-        "短期换手率波动相对长期换手率波动的偏离程度，"
-        "经MAD去极值、标准化及市值行业中性化；"
-        "华泰研究中因子值越低越优。"
-    ),
-    "formula": (
-        "raw_t=StdSamp(turn_{t-short_window+1:t}, turn>0)"
-        "/StdSamp(turn_{t-long_window+1:t}, turn>0)-1；"
-        "raw截面MAD去极值并Z-score后，对log(total_market_cap)"
-        "和可选行业哑变量回归，最终因子为残差Z-score。"
-    ),
     "input_schema": {
         "required": {
-            "date": {
-                "dtype": "datetime64[ns] 或可解析日期",
-                "meaning": "日频观测日期和目标因子截面日期。",
-            },
-            "instrument": {
-                "dtype": "string",
-                "meaning": (
-                    "证券唯一标识；同一date+instrument不允许重复。"
-                ),
-            },
-            "turn": {
-                "dtype": "float",
-                "meaning": (
-                    "日换手率；小于等于0的记录不参与滚动标准差。"
-                ),
-            },
-            "total_market_cap": {
-                "dtype": "float",
-                "meaning": (
-                    "目标日总市值；取自然对数后作为截面中性化控制变量。"
-                ),
-            },
+            'date': {},
+            'instrument': {},
+            'turn': {},
+            'total_market_cap': {},
         },
         "conditional": {
-            "industry": {
-                "dtype": "string",
-                "meaning": "目标日一级行业分类，用于构造行业哑变量。",
-                "required_when": {
-                    "neutralize_industry": True,
-                },
-            },
+            'industry': {"required_when": {'neutralize_industry': True}},
         },
     },
     "parameters": {
-        "target_dates": {
-            "default": None,
-            "accepted_values": "单个日期、日期序列或None。",
-            "effect": (
-                "指定实际输出截面；None输出data中全部日期。"
-            ),
-            "changes_data_requirements": True,
-        },
-        "as_of_date": {
-            "default": None,
-            "accepted_values": "可解析日期或None。",
-            "effect": (
-                "全局信息截止日，晚于该日的数据不参与计算。"
-            ),
-            "changes_data_requirements": False,
-        },
-        "short_window": {
-            "default": 5,
-            "accepted_values": (
-                "至少为2且小于long_window的整数。"
-            ),
-            "effect": "改变短期换手率波动窗口。",
-            "changes_data_requirements": False,
-        },
-        "long_window": {
-            "default": 504,
-            "accepted_values": (
-                "大于short_window的整数。"
-            ),
-            "effect": (
-                "改变长期基准波动窗口和所需历史预热长度。"
-            ),
-            "changes_data_requirements": True,
-        },
-        "min_short_observations": {
-            "default": 2,
-            "accepted_values": (
-                "2至short_window之间的整数。"
-            ),
-            "effect": (
-                "短窗口内正换手率有效观测不足时输出NaN。"
-            ),
-            "changes_data_requirements": False,
-        },
-        "min_long_observations": {
-            "default": 2,
-            "accepted_values": (
-                "2至long_window之间的整数。"
-            ),
-            "effect": (
-                "长窗口内正换手率有效观测不足时输出NaN。"
-            ),
-            "changes_data_requirements": False,
-        },
-        "neutralize_industry": {
-            "default": True,
-            "accepted_values": [True, False],
-            "effect": (
-                "True为市值+行业中性化；False为仅市值中性化。"
-            ),
-            "changes_data_requirements": True,
-        },
-        "winsor_k": {
-            "default": 5.0,
-            "accepted_values": "正数。",
-            "effect": "改变原始因子截面MAD去极值边界。",
-            "changes_data_requirements": False,
-        },
-        "min_cs_count": {
-            "default": 80,
-            "accepted_values": "正整数。",
-            "effect": "单日中性化的最小有效股票数。",
-            "changes_data_requirements": False,
-        },
-        "show_progress": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "仅控制进度显示，不改变计算结果。",
-            "changes_data_requirements": False,
-        },
-        "progress_every": {
-            "default": 20,
-            "accepted_values": "正整数。",
-            "effect": "进度刷新间隔，单位为目标截面数。",
-            "changes_data_requirements": False,
-        },
+        'target_dates': {"default": None},
+        'as_of_date': {"default": None},
+        'short_window': {"default": 5},
+        'long_window': {"default": 504},
+        'min_short_observations': {"default": 2},
+        'min_long_observations': {"default": 2},
+        'neutralize_industry': {"default": True},
+        'winsor_k': {"default": 5.0},
+        'min_cs_count': {"default": 80},
+        'show_progress': {"default": False},
+        'progress_every': {"default": 20},
     },
     "data_window": {
         "resolver": _resolve_bias_std_turn_nd_data_window,
@@ -609,100 +497,22 @@ FACTOR = {
             "requires_target_date_data": True,
             "minimum_history_observations": 503,
             "preheating_required": True,
-            "insufficient_window_behavior": (
-                "默认504日长窗口需要目标日前503个交易日；"
-                "历史或正换手率观测不足时输出NaN。"
-            ),
         },
-        "resolver_notes": (
-            "实际预热为long_window-1个目标日前交易日；"
-            "策略和评价函数必须使用本次resolved_factor_params解析。"
-        ),
     },
     "output_schema": {
-        "date": {
-            "dtype": "datetime64[ns]",
-            "meaning": "目标因子截面日期。",
-        },
-        "instrument": {
-            "dtype": "string",
-            "meaning": "证券唯一标识。",
-        },
-        "bias_std_turn_nd": {
-            "dtype": "float64",
-            "meaning": (
-                "市值行业中性化后的换手率波动偏离因子；"
-                "数值越低，按原华泰研究定义越优。"
-            ),
-        },
+        'date': {},
+        'instrument': {},
+        'bias_std_turn_nd': {},
     },
-    "usage_notes": [
-        (
-            "short_window=5、long_window=504对应旧notebook的"
-            "bias_std_turn_5d；short_window=11可复现敏感性测试中的"
-            "bias_std_turn_11d，无需新增因子脚本。"
-        ),
-        (
-            "因子层不执行ST、停牌、上市天数、板块或策略股票池过滤；"
-            "这些应由研究或策略层按信号日点时状态处理。"
-        ),
-        (
-            "若要与旧notebook研究样本严格对照，研究层还应使用"
-            "list_days>=730、非ST、非停牌及行业非空的信号日股票池。"
-        ),
-        (
-            "中性化结果依赖传入截面的股票范围；比较不同研究时必须"
-            "固定同一目标日期和同一中性化股票池。"
-        ),
-        "NaN结果不应填0，应由研究或策略层剔除。",
-    ],
-    "best_practice": {
-        "instance_name": "bias_std_turn_5d",
-        "parameters": {
-            "short_window": 5,
-            "long_window": 504,
-            "min_short_observations": 2,
-            "min_long_observations": 2,
-            "neutralize_industry": True,
-            "winsor_k": 5.0,
-            "min_cs_count": 80,
-        },
-        "description": (
-            "当前最佳实践为5日/504日换手率样本标准差比值偏离，"
-            "并使用市值行业中性化后的残差。"
-        ),
-    },
-    "pit_notes": [
-        (
-            "滚动标准差只使用目标日及以前的turn，不读取未来数据。"
-        ),
-        (
-            "行业和总市值必须是目标日点时可得数据；"
-            "不得使用当前行业分类回填历史。"
-        ),
-        (
-            "目标日收盘换手率参与计算，因此信号在目标日收盘后形成，"
-            "最早于下一可交易时点执行。"
-        ),
-    ],
-    "references": [
-        (
-            "LEO-LISHEN/Bigquant_research：研究稿/华泰因子复现/"
-            "华泰换手率类因子/bias_std_turn_5d因子/"
-            "bias_std_turn_5d.ipynb。"
-        ),
-        (
-            "BigQuant m_stddev为滚动样本标准差；迁移版本使用"
-            "pandas rolling.std(ddof=1)保持同一统计口径。"
-        ),
-    ],
-    "tags": [
-        "turnover",
-        "volatility_bias",
-        "size_neutralized",
-        "industry_neutralized",
-        "parameterized_window",
-    ],
-    "status": "research",
-    "version": "1.1.0",
 }
+
+
+FACTOR_INFO = """
+# 换手率偏离长期波动（N 日）
+
+衡量短期换手率相对长期换手率波动基准的偏离程度，并进行市值与可选行业中性化。数值越高表示近期交易活跃度偏离更明显。
+
+- **计算**：短窗与长窗由参数决定，因而预热长度随参数变化。
+- **时点**：仅使用目标日及此前的换手率、市值和行业数据。
+- **研究提示**：极端换手率可能同时反映事件冲击与流动性风险，应结合交易成本检验。
+"""

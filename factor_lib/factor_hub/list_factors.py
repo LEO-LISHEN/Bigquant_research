@@ -3,44 +3,33 @@
 
 import pandas as pd
 
-from factor_lib.factor_hub.discover_factors import discover_factors
+from factor_lib.factor_hub.discover_factors import (
+    discover_factor_infos,
+    discover_factors,
+)
 
 
-def list_factors(category=None):
-    """
-    返回因子简表。
+def _info_title(info, fallback):
+    """提取 Markdown 一级标题；说明文本无需遵守其他固定结构。"""
+    for line in info.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip() or fallback
+    return fallback
 
-    参数
-    ----
-    category : str，可选
-        例如 valuation、momentum、quality。
-    """
+
+def list_factors():
+    """返回因子名称及其研究说明标题，不再依赖经济类别或方向字段。"""
     factors = discover_factors()
-    rows = []
-
-    for name, factor in factors.items():
-        factor_category = factor.get("category", "未分类")
-
-        if category is not None and factor_category != category:
-            continue
-
-        direction = factor.get("direction")
-        direction_text = {
-            1: "正向（值越大越好）",
-            -1: "反向（值越小越好）",
-        }.get(direction, "未登记")
-
-        rows.append(
-            {
-                "name": name,
-                "category": factor_category,
-                "direction": direction_text,
-                "status": factor.get("status", "未登记"),
-                "description": factor.get("description", "未登记"),
-            }
-        )
-
-    return pd.DataFrame(
-        rows,
-        columns=["name", "category", "direction", "status", "description"],
-    ).sort_values(["category", "name"], ignore_index=True)
+    infos = discover_factor_infos()
+    rows = [
+        {
+            "name": name,
+            "info_title": _info_title(infos.get(name, ""), name),
+        }
+        for name in factors
+    ]
+    return pd.DataFrame(rows, columns=["name", "info_title"]).sort_values(
+        "name",
+        ignore_index=True,
+    )

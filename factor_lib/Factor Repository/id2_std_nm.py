@@ -503,152 +503,37 @@ def calc_id2_std_nm(
 
 
 FACTOR = {
-    "name": "id2_std_nm",
+    "name": 'id2_std_nm',
     "func": calc_id2_std_nm,
-    "category": "volatility",
-    "direction": -1,
-    "description": (
-        "个股N个月日收益对市场、规模和BP三个日收益因子回归后的"
-        "残差样本标准差，再进行市值行业中性化。"
-    ),
-    "formula": (
-        "size_return=small_cap_return-big_cap_return；"
-        "bp_return=low_pb_return-high_pb_return；"
-        "r_i=alpha+beta_mkt*r_m+beta_size*size_return+beta_bp*bp_return+epsilon；"
-        "raw=StdSamp(epsilon)；最终对log(total_market_cap)和行业哑变量"
-        "做截面回归。分组使用上一交易日市值和PB。"
-    ),
     "input_schema": {
         "required": {
-            "date": {
-                "dtype": "datetime64[ns] 或可解析日期",
-                "meaning": "日频观测日期及目标因子截面日期。",
-            },
-            "instrument": {
-                "dtype": "string",
-                "meaning": "证券唯一标识。",
-            },
-            "close": {
-                "dtype": "float",
-                "meaning": "复权口径一致的股票日收盘价。",
-            },
-            "total_market_cap": {
-                "dtype": "float",
-                "meaning": (
-                    "日总市值；滞后一期构造规模因子，目标日用于中性化。"
-                ),
-            },
-            "pb": {
-                "dtype": "float",
-                "meaning": "日PB；滞后一期构造高BP减低BP近似因子。",
-            },
-            "market_close": {
-                "dtype": "float",
-                "meaning": (
-                    "market_index 参数指定的市场代理指数原始日收盘点位；"
-                    "因子内部计算日收益率。"
-                ),
-            },
+            'date': {},
+            'instrument': {},
+            'close': {},
+            'total_market_cap': {},
+            'pb': {},
+            'market_close': {},
         },
         "conditional": {
-            "industry": {
-                "dtype": "string",
-                "meaning": "目标日点时可得的一级行业分类。",
-                "required_when": {"neutralize_industry": True},
-            },
+            'industry': {"required_when": {'neutralize_industry': True}},
         },
     },
     "parameters": {
-        "target_dates": {
-            "default": None,
-            "accepted_values": "单个日期、日期序列或None。",
-            "effect": "指定实际输出因子截面。",
-            "changes_data_requirements": True,
-        },
-        "as_of_date": {
-            "default": None,
-            "accepted_values": "可解析日期或None。",
-            "effect": "截断晚于信息截止日的数据。",
-            "changes_data_requirements": False,
-        },
-        "n_months": {
-            "default": 3,
-            "accepted_values": "正整数。",
-            "effect": "决定三因子时间序列回归月份窗口。",
-            "changes_data_requirements": True,
-        },
-        "trading_days_per_month": {
-            "default": 21,
-            "accepted_values": "正整数。",
-            "effect": "将月份换算为交易日。",
-            "changes_data_requirements": True,
-        },
-        "market_index": {
-            "default": "csi_all_share",
-            "accepted_values": "数据适配层支持的统一市场指数名称。",
-            "effect": "指定三因子回归使用的市场代理指数。",
-            "changes_data_requirements": True,
-        },
-        "min_ts_observations": {
-            "default": 40,
-            "accepted_values": "5至回归窗口长度之间的整数。",
-            "effect": "单只股票三因子回归的最少完整观测数。",
-            "changes_data_requirements": False,
-        },
-        "style_lower_quantile": {
-            "default": 0.30,
-            "accepted_values": "0至1之间且小于upper。",
-            "effect": "规模和PB低组边界。",
-            "changes_data_requirements": False,
-        },
-        "style_upper_quantile": {
-            "default": 0.70,
-            "accepted_values": "0至1之间且大于lower。",
-            "effect": "规模和PB高组边界。",
-            "changes_data_requirements": False,
-        },
-        "min_style_universe": {
-            "default": 200,
-            "accepted_values": "正整数。",
-            "effect": "每日构造规模和BP因子收益的最少股票数。",
-            "changes_data_requirements": False,
-        },
-        "neutralize_industry": {
-            "default": True,
-            "accepted_values": [True, False],
-            "effect": "True为市值+行业中性化；False仅做市值中性化。",
-            "changes_data_requirements": True,
-        },
-        "min_industry_count": {
-            "default": 5,
-            "accepted_values": "正整数。",
-            "effect": "目标日样本过少的行业合并为Other。",
-            "changes_data_requirements": False,
-        },
-        "min_cs_count": {
-            "default": 200,
-            "accepted_values": "正整数。",
-            "effect": "目标日市值行业中性化的最少有效股票数。",
-            "changes_data_requirements": False,
-        },
-        "standardize_residual": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "是否把中性化残差继续做样本Z-score。",
-            "changes_data_requirements": False,
-        },
-        "show_progress": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "只控制进度显示，不改变计算结果。",
-            "changes_data_requirements": False,
-        },
-        "progress_every": {
-            "default": 20,
-            "accepted_values": "正整数。",
-            "effect": "风格收益构造和目标截面的进度刷新间隔。",
-            "changes_data_requirements": False,
-        },
+        'target_dates': {"default": None},
+        'as_of_date': {"default": None},
+        'n_months': {"default": 3},
+        'trading_days_per_month': {"default": 21},
+        'market_index': {"default": 'csi_all_share'},
+        'min_ts_observations': {"default": 40},
+        'style_lower_quantile': {"default": 0.3},
+        'style_upper_quantile': {"default": 0.7},
+        'min_style_universe': {"default": 200},
+        'neutralize_industry': {"default": True},
+        'min_industry_count': {"default": 5},
+        'min_cs_count': {"default": 200},
+        'standardize_residual': {"default": False},
+        'show_progress': {"default": False},
+        'progress_every': {"default": 20},
     },
     "data_window": {
         "resolver": _resolve_id2_std_nm_data_window,
@@ -657,63 +542,22 @@ FACTOR = {
             "requires_target_date_data": True,
             "minimum_history_observations": 63,
             "preheating_required": True,
-            "insufficient_window_behavior": (
-                "默认63日窗口，完整三因子回归观测不足40日时输出NaN。"
-            ),
         },
-        "resolver_notes": (
-            "L个日收益以及首日风格分组所用滞后市值/PB均要求目标日前"
-            "至少L个交易日原始数据。"
-        ),
     },
     "output_schema": {
-        "date": {"dtype": "datetime64[ns]", "meaning": "目标截面日期。"},
-        "instrument": {"dtype": "string", "meaning": "证券唯一标识。"},
-        "id2_std_nm": {
-            "dtype": "float64",
-            "meaning": "市值行业中性化后的三因子特质波动率。",
-        },
+        'date': {},
+        'instrument': {},
+        'id2_std_nm': {},
     },
-    "usage_notes": [
-        "n_months=3、trading_days_per_month=21对应原id2_std_3m。",
-        "默认market_index='csi_all_share'，对应原Notebook的中证全指。",
-        "market_close由适配器独立加载，不会广播到每只股票行。",
-        "市场收益率只在因子内部由原始指数收盘点位计算。",
-        "规模和BP因子收益必须在完整的全A股形成股票池上构造，不能只用策略候选子集。",
-        "中性化结果依赖目标日截面股票池；预热不足产生的NaN不得填0。",
-    ],
-    "best_practice": {
-        "instance_name": "id2_std_3m",
-        "parameters": {
-            "n_months": 3,
-            "trading_days_per_month": 21,
-            "market_index": "csi_all_share",
-            "min_ts_observations": 40,
-            "style_lower_quantile": 0.30,
-            "style_upper_quantile": 0.70,
-            "min_style_universe": 200,
-            "neutralize_industry": True,
-            "min_industry_count": 5,
-            "min_cs_count": 200,
-            "standardize_residual": False,
-        },
-        "description": "原Notebook的3个月市值行业中性化三因子特质波动率。",
-    },
-    "pit_notes": [
-        "股票收益和由market_close计算的市场收益只使用目标日及以前数据。",
-        "规模和BP因子收益使用前一交易日市值与PB进行分组。",
-        "市场指数、行业、总市值和PB必须按历史日期提供。",
-        "目标日收盘价参与计算，因此信号最早在目标日收盘后形成。",
-    ],
-    "references": ["Bigquant_research：id2_std_3m因子.ipynb。"],
-    "tags": [
-        "volatility",
-        "idiosyncratic_volatility",
-        "three_factor_model",
-        "size_neutralized",
-        "industry_neutralized",
-        "parameterized_window",
-    ],
-    "status": "research",
-    "version": "2.0.0",
 }
+
+
+FACTOR_INFO = """
+# 三因子特质波动率（N 月）
+
+以个股收益对市场、规模和 BP 风格收益进行滚动回归，将残差波动率作为原始因子，再进行市值与可选行业中性化。数值较低通常代表较低的特质风险。
+
+- **计算**：规模与 BP 风格组合使用滞后一期市值和 PB 构造，避免同日收益前视。
+- **时点**：市场指数、股票行情、市值、PB 和行业均须为历史点时数据。
+- **推荐实例**：`n_months=3`、`market_index='csi_all_share'`。
+"""

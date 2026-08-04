@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import time
+import threading
 from collections.abc import Iterable, Mapping
 
 import numpy as np
@@ -228,7 +229,11 @@ def _quote_sql_literal(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _query_trading_calendar(end_date):
+def _query_trading_calendar(
+    end_date,
+    show_progress=False,
+    started_at=None,
+):
     """读取截至回测结束日的完整 A 股交易日历。"""
     import dai
 
@@ -238,7 +243,17 @@ def _query_trading_calendar(end_date):
     WHERE date <= '{end_date:%Y-%m-%d}'
     ORDER BY date
     """
-    calendar = dai.query(sql).df()
+    if started_at is None:
+        started_at = time.perf_counter()
+    calendar = _run_with_stage_heartbeat(
+        lambda: dai.query(sql).df(),
+        1,
+        8,
+        "读取A股交易日历",
+        started_at,
+        show_progress,
+        current=f"截止{end_date:%Y-%m-%d}",
+    )
     if calendar.empty or "date" not in calendar.columns:
         raise ValueError("未读取到有效的 A 股交易日历。")
 
@@ -350,7 +365,12 @@ def _build_factor_date_windows(
     return windows, pd.DatetimeIndex(sorted(all_dates))
 
 
-def _query_index_universe(index_codes, signal_dates):
+def _query_index_universe(
+    index_codes,
+    signal_dates,
+    show_progress=False,
+    started_at=None,
+):
     """读取一个或多个指数在各信号日的历史成分股。"""
     import dai
 
@@ -380,7 +400,18 @@ def _query_index_universe(index_codes, signal_dates):
             signal_dates.max().strftime("%Y-%m-%d"),
         ]
     }
-    panel = dai.query(sql, filters=partition_filters).df()
+    if started_at is None:
+        started_at = time.perf_counter()
+    panel = _run_with_stage_heartbeat(
+        lambda: dai.query(sql, filters=partition_filters).df(),
+        1,
+        8,
+        "读取历史指数成分股",
+        started_at,
+        show_progress,
+        current=",".join(index_codes),
+        detail=f"{len(signal_dates)}个信号日",
+    )
     if panel.empty:
         raise ValueError(
             f"未读取到指数 {index_codes} 在信号日的历史成分股。"
@@ -412,7 +443,12 @@ def _query_index_universe(index_codes, signal_dates):
     return panel
 
 
-def _build_universe_panel(universe_config, signal_dates):
+def _build_universe_panel(
+    universe_config,
+    signal_dates,
+    show_progress=False,
+    started_at=None,
+):
     """返回动态股票池面板，以及可用于减少查询量的静态代码并集。"""
     universe_type = universe_config["type"]
 
@@ -431,6 +467,8 @@ def _build_universe_panel(universe_config, signal_dates):
         panel = _query_index_universe(
             universe_config["index_codes"],
             signal_dates,
+            show_progress=show_progress,
+            started_at=started_at,
         )
         covered_dates = pd.DatetimeIndex(panel["date"].unique())
         missing_dates = signal_dates.difference(covered_dates)
@@ -883,6 +921,47 @@ def _render_progress(
     )
 
 
+def _run_with_stage_heartbeat(
+    action,
+    stage_number,
+    stage_total,
+    stage,
+    started_at,
+    show_progress,
+    current=None,
+    detail="",
+    interval_seconds=2.0,
+):
+    """单个阻塞阶段运行时定时刷新存活状态。"""
+    if not show_progress:
+        return action()
+
+    stop_event = threading.Event()
+
+    def heartbeat():
+        while not stop_event.wait(interval_seconds):
+            _render_progress(
+                stage_number,
+                stage_total,
+                f"{stage}（仍在运行）",
+                started_at,
+                current=current,
+                detail=detail,
+            )
+
+    worker = threading.Thread(
+        target=heartbeat,
+        name="market-cap-backtest-progress",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return action()
+    finally:
+        stop_event.set()
+        worker.join(timeout=max(interval_seconds, 0.1))
+
+
 def run_market_cap_group_backtest(
     start_date,
     end_date,
@@ -1041,7 +1120,11 @@ def run_market_cap_group_backtest(
             current=f"{start_date:%Y-%m-%d} 至 {end_date:%Y-%m-%d}",
         )
 
-    trading_calendar = _query_trading_calendar(end_date)
+    trading_calendar = _query_trading_calendar(
+        end_date,
+        show_progress=show_progress,
+        started_at=started_at,
+    )
     schedule = _build_schedule(
         trading_calendar=trading_calendar,
         start_date=start_date,
@@ -1088,6 +1171,8 @@ def run_market_cap_group_backtest(
     universe_panel, load_instruments = _build_universe_panel(
         universe_config,
         signal_dates,
+        show_progress=show_progress,
+        started_at=started_at,
     )
 
     if show_progress:
@@ -1107,7 +1192,7 @@ def run_market_cap_group_backtest(
         dates=factor_dates,
         factor_params=resolved_factor_params,
         instruments=load_instruments,
-        show_progress=False,
+        show_progress=show_progress,
     )
     factor_raw_data = _validate_panel(
         factor_raw_bundle.get_security_daily(),
@@ -1151,7 +1236,7 @@ def run_market_cap_group_backtest(
         standard_fields=signal_fields,
         dates=signal_dates,
         instruments=load_instruments,
-        show_progress=False,
+        show_progress=show_progress,
     )
     signal_panel = _validate_panel(
         signal_panel,
@@ -1201,7 +1286,7 @@ def run_market_cap_group_backtest(
         standard_fields=execution_fields,
         dates=execution_dates,
         instruments=load_instruments,
-        show_progress=False,
+        show_progress=show_progress,
     )
     execution_panel = _validate_panel(
         execution_panel,
@@ -1372,14 +1457,22 @@ def run_market_cap_group_backtest(
                     )
 
             factor_input = factor_raw_bundle.select_dates(required_dates)
-            factor_cross_section = get_factor(
-                factor_name,
-                factor_input,
-                target_dates=[signal_date],
-                as_of_date=signal_date,
-                show_progress=False,
-                progress_every=progress_every,
-                **resolved_factor_params,
+            factor_cross_section = _run_with_stage_heartbeat(
+                lambda: get_factor(
+                    factor_name,
+                    factor_input,
+                    target_dates=[signal_date],
+                    as_of_date=signal_date,
+                    show_progress=False,
+                    progress_every=progress_every,
+                    **resolved_factor_params,
+                ),
+                6,
+                8,
+                "回测中：计算信号日因子",
+                started_at,
+                show_progress,
+                current=f"{signal_date:%Y-%m-%d}，{factor_name}",
             )
             if show_progress:
                 _render_progress(

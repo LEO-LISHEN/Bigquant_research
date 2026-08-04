@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""华泰 N 日累计主力流出额因子。"""
+"""华泰 N 日累计主力流入额因子。"""
 
 import time
 
@@ -11,10 +11,10 @@ from factor_lib.common.preprocess.neutralize_size_industry import (
 )
 
 
-OUTPUT_COLUMNS = ["date", "instrument", "mfd_sellamt_nd"]
+OUTPUT_COLUMNS = ["date", "instrument", "mfd_buyamt_nd"]
 
 
-def _resolve_mfd_sellamt_nd_data_window(resolved_params):
+def _resolve_mfd_buyamt_nd_data_window(resolved_params):
     """根据 n_days 解析 N 日累计值需要的历史窗口。"""
     n_days = resolved_params.get("n_days", 1)
     if (
@@ -32,7 +32,7 @@ def _resolve_mfd_sellamt_nd_data_window(resolved_params):
         "minimum_history_observations": lookback_days,
         "preheating_required": lookback_days > 0,
         "insufficient_window_behavior": (
-            "目标日及以前的 N 日窗口内，有效主力流出额观测数低于 "
+            "目标日及以前的 N 日窗口内，有效主力流入额观测数低于 "
             "min_observations 时，该股票目标日因子值输出 NaN。"
         ),
     }
@@ -61,7 +61,7 @@ def _normalize_target_dates(data_dates, target_dates):
     if not missing.empty:
         preview = [date.strftime("%Y-%m-%d") for date in missing[:5]]
         raise ValueError(
-            "mfd_sellamt_nd 缺少目标日期原始数据："
+            "mfd_buyamt_nd 缺少目标日期原始数据："
             f"{preview}。请检查预存日期和 as_of_date。"
         )
     return normalized
@@ -101,7 +101,7 @@ def _robust_zscore(series, winsor_k):
     return result
 
 
-def calc_mfd_sellamt_nd(
+def calc_mfd_buyamt_nd(
     data,
     target_dates=None,
     as_of_date=None,
@@ -113,12 +113,12 @@ def calc_mfd_sellamt_nd(
     show_progress=False,
     progress_every=20,
 ):
-    """计算市值、行业中性化后的 N 日累计主力流出额因子。
+    """计算市值、行业中性化后的 N 日累计主力流入额因子。
 
     时间序列原始值为：
 
-    ``rolling_outflow_t = Sum(main_outflow_amount, N days)``
-    ``raw_t = -rolling_outflow_t``
+    ``rolling_inflow_t = Sum(main_inflow_amount, N days)``
+    ``raw_t = -rolling_inflow_t``
 
     随后逐目标日执行：
 
@@ -127,12 +127,12 @@ def calc_mfd_sellamt_nd(
     ``→ OLS残差再次scaled-MAD去极值 + 总体Z-score``
 
     负号复现旧 notebook 的反向化处理，因此最终数值越高，代表
-    N 日累计主力流出额越低，并按旧研究方向视为越优。
+    N 日累计主力流入额越低，并按旧研究方向视为越优。
 
     参数
     ----
     data : pandas.DataFrame
-        必须包含 date、instrument、main_outflow_amount、
+        必须包含 date、instrument、main_inflow_amount、
         float_market_cap；neutralize_industry=True 时还必须包含
         industry。data 应覆盖目标日及其 N-1 个历史预热交易日。
     target_dates : 日期或日期序列，可选
@@ -140,7 +140,7 @@ def calc_mfd_sellamt_nd(
     as_of_date : 日期，可选
         全局信息截止日，晚于该日的数据不会参与计算。
     n_days : int，默认 1
-        主力流出额累计窗口，包含目标日。
+        主力流入额累计窗口，包含目标日。
     min_observations : int 或 None，默认 None
         N 日窗口内最少有效资金流观测数；None 表示严格要求 N 个。
     neutralize_industry : bool，默认 True
@@ -157,13 +157,13 @@ def calc_mfd_sellamt_nd(
     返回
     ----
     pandas.DataFrame
-        date、instrument、mfd_sellamt_nd 三列。预热不足、资金流缺失、
+        date、instrument、mfd_buyamt_nd 三列。预热不足、资金流缺失、
         市值无效或中性化样本不足时保留 NaN，不填充为 0。
     """
     if not isinstance(data, pd.DataFrame):
         raise TypeError("data 必须是 pandas.DataFrame。")
 
-    window_info = _resolve_mfd_sellamt_nd_data_window(
+    window_info = _resolve_mfd_buyamt_nd_data_window(
         {"n_days": n_days}
     )
     n_days = window_info["lookback_trading_days"] + 1
@@ -202,7 +202,7 @@ def calc_mfd_sellamt_nd(
     required_columns = {
         "date",
         "instrument",
-        "main_outflow_amount",
+        "main_inflow_amount",
         "float_market_cap",
     }
     if neutralize_industry:
@@ -210,14 +210,14 @@ def calc_mfd_sellamt_nd(
     missing_columns = required_columns - set(data.columns)
     if missing_columns:
         raise ValueError(
-            "mfd_sellamt_nd 因子缺少字段："
+            "mfd_buyamt_nd 因子缺少字段："
             f"{sorted(missing_columns)}"
         )
 
     selected_columns = [
         "date",
         "instrument",
-        "main_outflow_amount",
+        "main_inflow_amount",
         "float_market_cap",
     ]
     if neutralize_industry:
@@ -228,9 +228,9 @@ def calc_mfd_sellamt_nd(
         df["date"], errors="coerce"
     ).dt.normalize()
     if df["date"].isna().any():
-        raise ValueError("mfd_sellamt_nd 输入存在无效 date。")
+        raise ValueError("mfd_buyamt_nd 输入存在无效 date。")
     if df["instrument"].isna().any():
-        raise ValueError("mfd_sellamt_nd 的 instrument 不允许缺失。")
+        raise ValueError("mfd_buyamt_nd 的 instrument 不允许缺失。")
 
     duplicated = df.duplicated(["date", "instrument"], keep=False)
     if duplicated.any():
@@ -241,11 +241,11 @@ def calc_mfd_sellamt_nd(
             .to_dict("records")
         )
         raise ValueError(
-            "mfd_sellamt_nd 输入存在重复 date + instrument："
+            "mfd_buyamt_nd 输入存在重复 date + instrument："
             f"{examples}"
         )
 
-    for column in ["main_outflow_amount", "float_market_cap"]:
+    for column in ["main_inflow_amount", "float_market_cap"]:
         df[column] = pd.to_numeric(
             df[column], errors="coerce"
         ).replace([np.inf, -np.inf], np.nan)
@@ -272,15 +272,15 @@ def calc_mfd_sellamt_nd(
 
     if show_progress:
         print(
-            "\r[mfd_sellamt_nd] [1/2] "
-            f"计算 {n_days} 日累计主力流出额...",
+            "\r[mfd_buyamt_nd] [1/2] "
+            f"计算 {n_days} 日累计主力流入额...",
             end="",
             flush=True,
         )
 
     try:
         rolling_amount = (
-            df.groupby("instrument", sort=False)["main_outflow_amount"]
+            df.groupby("instrument", sort=False)["main_inflow_amount"]
             .rolling(
                 window=n_days,
                 min_periods=int(min_observations),
@@ -327,7 +327,7 @@ def calc_mfd_sellamt_nd(
                     {
                         "date": date,
                         "instrument": section["instrument"].to_numpy(),
-                        "mfd_sellamt_nd": factor.to_numpy(),
+                        "mfd_buyamt_nd": factor.to_numpy(),
                     }
                 )
             )
@@ -341,7 +341,7 @@ def calc_mfd_sellamt_nd(
                 elapsed = time.perf_counter() - started_at
                 remaining = elapsed / position * (total_dates - position)
                 print(
-                    "\r[mfd_sellamt_nd] [2/2] "
+                    "\r[mfd_buyamt_nd] [2/2] "
                     f"{position}/{total_dates} 个截面 "
                     f"| {position / total_dates:.1%} "
                     f"| 当前：{date:%Y-%m-%d} "
@@ -366,179 +366,53 @@ def calc_mfd_sellamt_nd(
 
 
 FACTOR = {
-    "name": "mfd_sellamt_nd",
-    "func": calc_mfd_sellamt_nd,
-    "category": "moneyflow",
-    "direction": 1,
-    "description": (
-        "过去 N 个交易日主力流出额累计值的反向因子，经稳健标准化、"
-        "流通市值和可选行业中性化，并对残差再次稳健标准化；"
-        "最终数值越高，按旧华泰研究方向越优。"
-    ),
-    "formula": (
-        "sum_outflow_t=Sum(main_outflow_amount_{t-N+1:t})；"
-        "raw_t=-sum_outflow_t；raw逐截面执行scaled-MAD去极值和总体"
-        "Z-score，再对log(float_market_cap)和可选行业哑变量做OLS；"
-        "最终因子为残差再次scaled-MAD去极值后的总体Z-score。"
-    ),
+    "name": 'mfd_buyamt_nd',
+    "func": calc_mfd_buyamt_nd,
     "input_schema": {
         "required": {
-            "date": {
-                "dtype": "datetime64[ns] 或可解析日期",
-                "meaning": "日频资金流观测日期及目标因子截面日期。",
-            },
-            "instrument": {
-                "dtype": "string",
-                "meaning": "证券唯一标识；同一date+instrument不允许重复。",
-            },
-            "main_outflow_amount": {
-                "dtype": "float",
-                "meaning": (
-                    "单日主力流出额；语义为主力被动买入额与主力主动"
-                    "卖出额之和，金额单位必须在整个窗口内一致。"
-                ),
-            },
-            "float_market_cap": {
-                "dtype": "float",
-                "meaning": "目标日流通市值；取自然对数后用于截面中性化。",
-            },
+            'date': {},
+            'instrument': {},
+            'main_inflow_amount': {},
+            'float_market_cap': {},
         },
         "conditional": {
-            "industry": {
-                "dtype": "string",
-                "meaning": "目标日点时可得的一级行业分类。",
-                "required_when": {"neutralize_industry": True},
-            },
+            'industry': {"required_when": {'neutralize_industry': True}},
         },
     },
     "parameters": {
-        "target_dates": {
-            "default": None,
-            "accepted_values": "单个日期、日期序列或None。",
-            "effect": "指定实际输出截面；None输出data中的全部日期。",
-            "changes_data_requirements": True,
-        },
-        "as_of_date": {
-            "default": None,
-            "accepted_values": "可解析日期或None。",
-            "effect": "全局信息截止日，晚于该日的数据不参与计算。",
-            "changes_data_requirements": False,
-        },
-        "n_days": {
-            "default": 1,
-            "accepted_values": "正整数。",
-            "effect": "决定主力流出额累计窗口和历史预热长度。",
-            "changes_data_requirements": True,
-        },
-        "min_observations": {
-            "default": None,
-            "accepted_values": "1至n_days之间的整数或None。",
-            "effect": "控制N日窗口内最少有效资金流观测数；None等于n_days。",
-            "changes_data_requirements": False,
-        },
-        "neutralize_industry": {
-            "default": True,
-            "accepted_values": [True, False],
-            "effect": "True为流通市值+行业中性化；False仅做市值中性化。",
-            "changes_data_requirements": True,
-        },
-        "winsor_k": {
-            "default": 3.0,
-            "accepted_values": "有限正数。",
-            "effect": "控制两次scaled-MAD去极值边界。",
-            "changes_data_requirements": False,
-        },
-        "min_cs_count": {
-            "default": 30,
-            "accepted_values": "大于等于3的整数。",
-            "effect": "控制单日中性化的最低有效样本数。",
-            "changes_data_requirements": False,
-        },
-        "show_progress": {
-            "default": False,
-            "accepted_values": [True, False],
-            "effect": "仅控制进度显示，不改变计算结果。",
-            "changes_data_requirements": False,
-        },
-        "progress_every": {
-            "default": 20,
-            "accepted_values": "正整数。",
-            "effect": "进度刷新间隔，单位为目标截面数。",
-            "changes_data_requirements": False,
-        },
+        'target_dates': {"default": None},
+        'as_of_date': {"default": None},
+        'n_days': {"default": 1},
+        'min_observations': {"default": None},
+        'neutralize_industry': {"default": True},
+        'winsor_k': {"default": 3.0},
+        'min_cs_count': {"default": 30},
+        'show_progress': {"default": False},
+        'progress_every': {"default": 20},
     },
     "data_window": {
-        "resolver": _resolve_mfd_sellamt_nd_data_window,
+        "resolver": _resolve_mfd_buyamt_nd_data_window,
         "default": {
             "lookback_trading_days": 0,
             "requires_target_date_data": True,
             "minimum_history_observations": 0,
             "preheating_required": False,
-            "insufficient_window_behavior": (
-                "默认1日实例不需要历史预热；单日资金流缺失时输出NaN。"
-            ),
         },
-        "resolver_notes": (
-            "N日累计窗口包含目标日，因此实际预热为n_days-1个交易日；"
-            "策略和评价函数必须使用本次resolved_factor_params解析窗口。"
-        ),
     },
     "output_schema": {
-        "date": {
-            "dtype": "datetime64[ns]",
-            "meaning": "目标因子截面日期。",
-        },
-        "instrument": {
-            "dtype": "string",
-            "meaning": "证券唯一标识。",
-        },
-        "mfd_sellamt_nd": {
-            "dtype": "float64",
-            "meaning": (
-                "市值行业中性化后的N日累计主力流出额反向因子；"
-                "数值越高，按旧华泰研究方向越优。"
-            ),
-        },
+        'date': {},
+        'instrument': {},
+        'mfd_buyamt_nd': {},
     },
-    "usage_notes": [
-        "n_days=1复现旧notebook的mfd_sellamt_d。",
-        "min_observations=None时严格要求窗口内N个有效日频观测。",
-        "因子层不负责ST、停牌、上市天数、板块或策略股票池过滤。",
-        "研究和策略层应剔除NaN因子值，不应填充为0。",
-        "中性化结果依赖目标日股票截面，跨研究比较时应固定股票池。",
-    ],
-    "best_practice": {
-        "instance_name": "mfd_sellamt_1d",
-        "parameters": {
-            "n_days": 1,
-            "min_observations": None,
-            "neutralize_industry": True,
-            "winsor_k": 3.0,
-            "min_cs_count": 30,
-        },
-        "description": "当前最佳实践保留原研究的单日主力流出额实例。",
-    },
-    "pit_notes": [
-        "滚动累计只使用目标日及以前的数据，不读取未来资金流。",
-        "行业和流通市值必须使用对应历史目标日的点时值。",
-        "目标日完整资金流依赖当日成交，因此信号在目标日收盘后形成。",
-        "不同数据源对主力单的划分阈值可能不同，跨源对照必须核对定义。",
-    ],
-    "references": [
-        (
-            "Bigquant_research：研究稿/华泰因子复现/华泰资金流向类因子/"
-            "mfd_sellamt_d因子/mfd_sellamt_d.ipynb。"
-        ),
-        "BigQuant cn_stock_moneyflow 官方字段说明。",
-    ],
-    "tags": [
-        "moneyflow",
-        "main_outflow_amount",
-        "rolling_sum",
-        "size_neutralized",
-        "industry_neutralized",
-        "parameterized_window",
-    ],
-    "status": "research",
-    "version": "1.0.0",
 }
+
+
+FACTOR_INFO = """
+# 主力资金流入金额累计（N 日）
+
+计算主力资金流入金额的 N 日累计值，并按流通市值调整、去极值、标准化及可选行业中性化。数值越高代表近期资金流入更强。
+
+- **计算**：N 日主力流入金额累计后，以流通市值为尺度处理。
+- **时点**：资金流、市值和行业字段均须为目标日点时可得数据。
+- **推荐实例**：`n_days=1`；扩大窗口时须同步增加预热数据。
+"""
