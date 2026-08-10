@@ -20,12 +20,15 @@
 
 ## 2. 目录结构
 
-目录仅按职责划分。`Factor Repository` 内部可以继续按因子类别扩展，但本 README 不固定具体类别和因子文件。
+目录先按职责划分；`Factor Repository` 再严格按“因子如何生成”划分为普通单因子、普通复合因子和机器学习因子。该分类不按动量、价值、质量等经济含义划分。
 
 ```text
 factor_lib/
 ├── README.md
 ├── Factor Repository/
+│   ├── base_factors/
+│   ├── composite_factors/
+│   └── machine_learning_factors/
 ├── common/
 │   ├── preprocess/
 │   ├── factor_evaluation/
@@ -38,7 +41,9 @@ factor_lib/
 
 | 目录 | 职责 |
 |---|---|
-| `Factor Repository/` | 存放因子计算脚本及其 `FACTOR` 元数据；原则上一个参数化因子族一个脚本。 |
+| `Factor Repository/base_factors/` | 普通单因子：只依赖原始语义字段；原则上一个参数化因子族一个脚本。 |
+| `Factor Repository/composite_factors/` | 普通复合因子：依赖其他因子的输出，按规则、线性组合或其他非机器学习方法生成新因子。 |
+| `Factor Repository/machine_learning_factors/` | 机器学习因子：依赖基础因子特征及模型状态，输出模型截面评分。 |
 | `common/preprocess/` | 存放可跨因子复用的纯预处理函数，例如去极值、标准化和中性化。 |
 | `common/factor_evaluation/` | 存放因子基础指标、相关性分析及配套绘图等统一评价入口。 |
 | `common/strategies/` | 存放可复用的选股、组合构建和回测策略模板。 |
@@ -120,7 +125,27 @@ industry
 
 ## 5. 因子脚本规范
 
-### 5.1 一个参数化因子族一个脚本
+### 5.1 因子类型、目录与依赖边界
+
+每个因子脚本必须以 `FACTOR["factor_type"]` 声明类型，并放入对应目录：
+
+| `factor_type` | 存放目录 | 定义 | 候选因子管理 |
+|---|---|---|---|
+| `"base"` | `base_factors/` | 仅使用原始语义字段计算。使用多个字段、滚动窗口、行业/市值中性化或公共预处理，仍属于基础因子。 | 可进入 |
+| `"composite"` | `composite_factors/` | 直接依赖其他因子输出，按确定性规则、权重或线性组合生成。 | 不可进入 |
+| `"machine_learning"` | `machine_learning_factors/` | 依赖基础因子特征与模型状态，训练或推理后输出截面评分。 | 不可进入 |
+
+不要把“使用多个原始字段”误判为复合因子。分类唯一依据是：计算是否直接消费其他因子的输出，及是否依赖机器学习模型状态。
+
+`candidate_instances` 仅允许出现在 `factor_type="base"` 的脚本中。无可调参数的基础因子也应写为：
+
+```python
+"candidate_instances": {"default": {}},
+```
+
+复合因子和机器学习因子应以自身的依赖声明、参数和 `FACTOR_INFO` 说明特征或子因子来源，不得登记为基础候选实例。
+
+### 5.2 一个参数化因子族一个脚本
 
 仅时间窗口、衰减参数、最小观测数或处理开关不同的因子，应视为同一个因子族。
 
@@ -132,11 +157,11 @@ return_1m、return_3m、return_6m
 return_nm.py + n_months 参数
 ```
 
-不要因为参数不同复制多个高度相似的脚本。推荐实例可以写入 `FACTOR["best_practice"]`，但不能代替参数化设计。
+不要因为参数不同复制多个高度相似的脚本。参数化基础因子的常用候选实例必须写入 `FACTOR["candidate_instances"]`，但不能代替参数化设计。`best_practice` 如仍保留，只能作为研究说明，不能被候选因子管理器读取。
 
 只有在公式、数据语义或处理流程发生本质变化时，才应新建因子脚本。
 
-### 5.2 统一因子函数接口
+### 5.3 统一因子函数接口
 
 推荐接口为：
 
@@ -163,7 +188,7 @@ def calc_factor(
 
 当 `target_dates=None` 时，函数可以按自身文档约定计算输入数据中所有可计算日期；策略和正式评价入口必须显式传入目标日期。
 
-### 5.3 统一输出
+### 5.4 统一输出
 
 所有因子函数统一返回长表：
 
@@ -182,7 +207,7 @@ date | instrument | factor_name
 - 结果应按 `date`、`instrument` 稳定排序；
 - 不返回标签、分组、持仓、收益率或图表。
 
-### 5.4 因子内部允许与禁止的内容
+### 5.5 因子内部允许与禁止的内容
 
 因子脚本允许：
 
@@ -214,6 +239,8 @@ date | instrument | factor_name
 |---|---|
 | `name` | 因子中心使用的唯一名称，也应与输出因子值列名一致。 |
 | `func` | 实际因子计算函数对象。 |
+| `factor_type` | 必填。`base`、`composite` 或 `machine_learning`；决定目录归属及是否可进入候选因子管理。 |
+| `candidate_instances` | 仅 `base` 因子必填。以 `{实例名: 参数字典}` 登记需要参与候选管理的常用实例；无参数因子使用 `{"default": {}}`。 |
 | `category` | 因子类别，用于查询和组织。 |
 | `direction` | 经验方向：`1` 表示值越大通常越优，`-1` 表示值越小通常越优。 |
 | `description` | 简明说明因子的经济含义与主要处理流程。 |
@@ -343,7 +370,7 @@ def _resolve_example_data_window(resolved_params):
 
 不同因子可以按需要增加以下字段，其他因子无需被迫同步增加：
 
-- `best_practice`
+- `best_practice`（仅研究说明；不可替代 `candidate_instances`）
 - `references`
 - `research_findings`
 - `tags`
@@ -360,6 +387,10 @@ def _resolve_example_data_window(resolved_params):
 FACTOR = {
     "name": "example_factor_nm",
     "func": calc_example_factor_nm,
+    "factor_type": "base",
+    "candidate_instances": {
+        "6m": {"n_months": 6, "trading_days_per_month": 21},
+    },
     "category": "example",
     "direction": 1,
     "description": "因子经济含义和主要处理流程。",
@@ -464,6 +495,39 @@ display(describe_factor("factor_name"))
 3. 重新启动 Notebook 内核或刷新因子发现缓存。
 
 不需要在中心登记表中重复手工登记。
+
+因子中心递归扫描 `Factor Repository` 的子目录，研究、评价和策略代码应始终通过因子名称调用 `get_factor()`，不得把某个物理文件路径写成公共调用契约。因此移动因子文件到三类目录不会改变其公开调用方式。
+
+### 8.1 候选基础因子管理
+
+候选因子管理器用于为普通复合因子和机器学习因子筛选可研究的基础特征，不负责构造最终组合或训练最终模型。
+
+- 唯一候选输入为 `{因子名称: 参数字典、参数字典列表或 None}`；
+- 值为 `None` 时，自动展开该基础因子 `FACTOR["candidate_instances"]` 中登记的全部实例；
+- 仅接受 `factor_type="base"`；传入 `composite` 或 `machine_learning` 因子必须明确报错；
+- 输出暴露相似度矩阵、聚类分组、组内有效性排序和热力图；
+- 组内排序是研究诊断，不等于增量检验、最终特征选择或可交易策略结论；
+- 同一参数化因子的多个常用实例可同时参与聚类，实例名和参数必须保留在结果中以便审计。
+
+```python
+from factor_lib.function.bigquant_function.factor_evaluation.factor_candidate_clustering import (
+    cluster_and_rank_factor_candidates,
+)
+
+result = cluster_and_rank_factor_candidates(
+    candidate_spec={
+        "book_to_price": None,
+        "exp_wgt_return_nm": None,
+        "return_nd": None,
+    },
+    start_date="2022-01-01",
+    end_date="2024-12-31",
+    frequency=20,
+    holding_period_days=20,
+    cluster_count=3,
+    show_progress=True,
+)
+```
 
 ## 9. 因子评价规范
 
@@ -738,6 +802,8 @@ GitHub 用于保存可复现代码和有意义的变更记录。原始大数据�
 
 - [ ] 已搜索现有因子，确认不是同类参数实例；
 - [ ] 相同公式的窗口差异已经参数化；
+- [ ] 已确定 `factor_type`，并放入正确的三类因子目录；
+- [ ] 若为基础因子，已登记有研究意义的 `candidate_instances`；若为复合或机器学习因子，未错误登记候选实例；
 - [ ] 函数只接收标准字段；
 - [ ] 没有 `dai`、SQL、平台表名和策略代码；
 - [ ] `data` 与 `target_dates` 分离；

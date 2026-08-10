@@ -29,9 +29,13 @@ FACTOR["candidate_instances"] 约定
 
 from __future__ import annotations
 
+import json
 import math
+import re
 import time
+from datetime import date, datetime
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -609,6 +613,185 @@ def _display_dataframe(frame):
         print(frame.to_string(index=False))
 
 
+def _rank_ic_direction(value):
+    """将原始 RankIC 符号转换为便于阅读的方向标签。"""
+    if pd.isna(value) or abs(float(value)) < 1e-12:
+        return "方向不明显"
+    return "正向" if value > 0 else "负向"
+
+
+def _evidence_level(hac_t):
+    """仅供展示，不参与有效性分数或组内排序。"""
+    if pd.isna(hac_t):
+        return "无法判断"
+    absolute_t = abs(float(hac_t))
+    if absolute_t >= 3.0:
+        return "强"
+    if absolute_t >= 2.0:
+        return "待验证"
+    return "证据不足"
+
+
+def _build_group_ranking_display(ranking):
+    """构造 Notebook 阅读版排序表，保留原始参数以支持实例间比较。"""
+    display = ranking.loc[
+        :,
+        [
+            "group_id",
+            "group_rank",
+            "factor_name",
+            "instance_id",
+            "factor_params",
+            "rank_ic_mean",
+            "rank_ic_hac_t",
+            "coverage",
+            "effectiveness_score",
+        ],
+    ].copy()
+    display.insert(
+        5,
+        "direction",
+        display["rank_ic_mean"].map(_rank_ic_direction),
+    )
+    display.insert(
+        8,
+        "evidence_level",
+        display["rank_ic_hac_t"].map(_evidence_level),
+    )
+    display = display.rename(
+        columns={
+            "group_id": "组别",
+            "group_rank": "组内排名",
+            "factor_name": "因子",
+            "instance_id": "实例",
+            "factor_params": "参数",
+            "direction": "方向",
+            "rank_ic_mean": "平均 RankIC",
+            "rank_ic_hac_t": "HAC t 值",
+            "evidence_level": "统计证据",
+            "coverage": "覆盖率",
+            "effectiveness_score": "有效性分数",
+        }
+    )
+    display["平均 RankIC"] = display["平均 RankIC"].map(
+        lambda value: "—" if pd.isna(value) else f"{float(value):+.4f}"
+    )
+    display["HAC t 值"] = display["HAC t 值"].map(
+        lambda value: "—" if pd.isna(value) else f"{float(value):+.2f}"
+    )
+    display["覆盖率"] = display["覆盖率"].map(
+        lambda value: "—" if pd.isna(value) else f"{float(value):.1%}"
+    )
+    display["有效性分数"] = display["有效性分数"].map(
+        lambda value: "—" if pd.isna(value) else f"{float(value):.4f}"
+    )
+    return display
+
+
+def _display_group_ranking(group_summary, ranking_display):
+    """先展示组代表，再按组展示紧凑的组内候选清单。"""
+    _display_dataframe(group_summary)
+    try:
+        from IPython.display import Markdown, display
+
+        show_title = lambda text: display(Markdown(f"#### {text}"))
+    except ImportError:
+        show_title = print
+
+    summary_by_group = group_summary.set_index("group_id")
+    for group_id, group in ranking_display.groupby("组别", sort=True):
+        representative = summary_by_group.loc[group_id]
+        show_title(
+            f"第 {group_id} 组｜代表："
+            f"{representative['representative_candidate_id']}｜"
+            f"成员：{int(representative['member_count'])} 个"
+        )
+        _display_dataframe(group.reset_index(drop=True))
+
+
+def _json_default(value):
+    if isinstance(value, (pd.Timestamp, datetime, date, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if not np.isfinite(value) else float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if pd.isna(value):
+        return None
+    raise TypeError(f"无法序列化为 JSON：{type(value).__name__}")
+
+
+def _frame_records(frame):
+    """将 DataFrame 转换为 JSON 友好的 records，且把 NaN 写为 null。"""
+    return json.loads(frame.to_json(orient="records", date_format="iso"))
+
+
+def _safe_file_stem(run_name):
+    if run_name is None:
+        return "factor_candidate_management"
+    if not isinstance(run_name, str) or not run_name.strip():
+        raise ValueError("run_name 必须是非空字符串或 None。")
+    stem = re.sub(r"[^0-9A-Za-z._-]+", "_", run_name.strip()).strip("._-")
+    if not stem:
+        raise ValueError("run_name 未包含可用于文件名的字符。")
+    return stem
+
+
+def _save_management_result(
+    output_dir,
+    run_name,
+    run_parameters,
+    group_summary,
+    ranking,
+    similarity,
+    pair_counts,
+    schedule,
+    resolved_candidates,
+):
+    """显式保存单个、机器与 LLM 均可读取的 JSON 研究报告。"""
+    directory = Path(output_dir)
+    if not directory.exists() or not directory.is_dir():
+        raise FileNotFoundError(
+            f"输出目录不存在或不是文件夹：{directory}。"
+            "请先创建 factor_management_outputs，再传入该目录。"
+        )
+
+    stem = _safe_file_stem(run_name)
+    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    path = directory / f"{stem}_{timestamp}.json"
+    serial = 1
+    while path.exists():
+        path = directory / f"{stem}_{timestamp}_{serial}.json"
+        serial += 1
+
+    payload = {
+        "schema_version": 1,
+        "generated_at": pd.Timestamp.now().isoformat(),
+        "run_parameters": run_parameters,
+        "group_summary": _frame_records(group_summary),
+        "group_ranking": _frame_records(ranking),
+        "resolved_candidates": _frame_records(resolved_candidates),
+        "evaluation_schedule": _frame_records(schedule),
+        "similarity_matrix": {
+            "index": list(similarity.index),
+            "columns": list(similarity.columns),
+            "data": similarity.astype(object).where(similarity.notna(), None).values.tolist(),
+        },
+        "pairwise_observation_count": {
+            "index": list(pair_counts.index),
+            "columns": list(pair_counts.columns),
+            "data": pair_counts.astype(object).where(pair_counts.notna(), None).values.tolist(),
+        },
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    return path
+
+
 def cluster_and_rank_factor_candidates(
     candidate_spec,
     start_date,
@@ -623,6 +806,9 @@ def cluster_and_rank_factor_candidates(
     similarity_min_obs=None,
     plot=True,
     display_results=True,
+    save_result=False,
+    output_dir="factor_lib/factor_management_outputs",
+    run_name=None,
     show_progress=True,
     progress_every=20,
 ):
@@ -653,12 +839,23 @@ def cluster_and_rank_factor_candidates(
         有效性分数中“统计可信度达到饱和”的 |HAC t| 阈值，默认 2。
     similarity_min_obs : int or None
         两个因子在单日截面计算暴露相关性所需的最小共同股票数；默认沿用 min_obs。
+    save_result : bool, default False
+        True 时将本次运行的原始 ``group_ranking``、分组概要、相似度矩阵、
+        运行参数和候选实例保存为单个 JSON 文件；默认不写文件。
+    output_dir : str or path-like
+        ``save_result=True`` 时使用的既有输出目录；默认是
+        ``factor_lib/factor_management_outputs``。函数不会自动创建该目录。
+    run_name : str or None
+        保存文件的可读名称前缀；None 时使用 ``factor_candidate_management``。
 
     Returns
     -------
     dict
         ``group_summary``：每个组的代表候选实例；
         ``candidate_ranking``：所有候选实例的原始 RankIC、HAC t、覆盖率与组内名次；
+        ``group_ranking``：与 ``candidate_ranking`` 相同的兼容别名；
+        ``group_ranking_display``：Notebook 分组展示版，保留原始参数字典；
+        ``saved_result_path``：显式保存时生成的 JSON 文件路径，否则为 None；
         ``similarity_matrix``：聚类依据；
         ``pairwise_observation_count``：每对因子的有效共同截面数；
         ``evaluation_schedule``、``heatmap_figure``、``heatmap_axis``。
@@ -674,7 +871,7 @@ def cluster_and_rank_factor_candidates(
     RankIC 符号，方便识别该因子在研究期内的实际方向。
     """
     started_at = time.perf_counter()
-    stage_total = 6
+    stage_total = 7 if save_result else 6
     try:
         start_date = _normalize_date(start_date, "start_date")
         end_date = _normalize_date(end_date, "end_date")
@@ -695,6 +892,10 @@ def cluster_and_rank_factor_candidates(
         if not isinstance(significance_threshold, (int, float, np.number)) or significance_threshold <= 0:
             raise ValueError("significance_threshold 必须为正数。")
         significance_threshold = float(significance_threshold)
+        if not isinstance(save_result, (bool, np.bool_)):
+            raise TypeError("save_result 必须为 bool。")
+        if not isinstance(output_dir, (str, Path)):
+            raise TypeError("output_dir 必须是路径字符串或 pathlib.Path。")
         instruments = _normalize_instruments(instruments)
         candidates = _resolve_candidates(candidate_spec)
         if cluster_count > len(candidates):
@@ -953,38 +1154,77 @@ def cluster_and_rank_factor_candidates(
                 "候选因子暴露相似度热力图",
                 show=True,
             )
+
+        ranking_display = _build_group_ranking_display(ranking)
+        ordered_similarity = similarity.loc[ordered_ids, ordered_ids]
+        ordered_pair_counts = pair_counts.loc[ordered_ids, ordered_ids]
+        resolved_candidates = pd.DataFrame(
+            [
+                {
+                    "candidate_id": item["candidate_id"],
+                    "factor_name": item["factor_name"],
+                    "instance_id": item["instance_id"],
+                    "factor_params": item["factor_params"],
+                }
+                for item in candidates
+            ]
+        )
+
+        saved_result_path = None
+        if save_result:
+            if show_progress:
+                _render_progress(7, stage_total, "保存候选因子管理 JSON 报告", started_at)
+            saved_result_path = _save_management_result(
+                output_dir=output_dir,
+                run_name=run_name,
+                run_parameters={
+                    "candidate_spec": candidate_spec,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "frequency": frequency,
+                    "holding_period_days": holding_period_days,
+                    "cluster_count": cluster_count,
+                    "instruments": instruments,
+                    "min_obs": min_obs,
+                    "hac_lags": hac_lags,
+                    "significance_threshold": significance_threshold,
+                    "similarity_min_obs": similarity_min_obs,
+                },
+                group_summary=group_summary,
+                ranking=ranking,
+                similarity=ordered_similarity,
+                pair_counts=ordered_pair_counts,
+                schedule=schedule,
+                resolved_candidates=resolved_candidates,
+            )
         if display_results:
-            _display_dataframe(group_summary)
-            _display_dataframe(ranking)
+            _display_group_ranking(group_summary, ranking_display)
         if show_progress:
             _render_progress(
-                6,
+                stage_total,
                 stage_total,
                 "完成",
                 started_at,
                 completed=len(candidates),
                 total=len(candidates),
-                current=f"{len(group_summary)} 个因子组",
+                current=(
+                    f"{len(group_summary)} 个因子组"
+                    if saved_result_path is None
+                    else f"{len(group_summary)} 个因子组；已保存 {saved_result_path}"
+                ),
             )
         return {
             "group_summary": group_summary,
             "candidate_ranking": ranking,
-            "similarity_matrix": similarity.loc[ordered_ids, ordered_ids],
-            "pairwise_observation_count": pair_counts.loc[ordered_ids, ordered_ids],
+            "group_ranking": ranking,
+            "group_ranking_display": ranking_display,
+            "similarity_matrix": ordered_similarity,
+            "pairwise_observation_count": ordered_pair_counts,
             "evaluation_schedule": schedule,
             "heatmap_figure": figure,
             "heatmap_axis": axis,
-            "resolved_candidates": pd.DataFrame(
-                [
-                    {
-                        "candidate_id": item["candidate_id"],
-                        "factor_name": item["factor_name"],
-                        "instance_id": item["instance_id"],
-                        "factor_params": item["factor_params"],
-                    }
-                    for item in candidates
-                ]
-            ),
+            "resolved_candidates": resolved_candidates,
+            "saved_result_path": saved_result_path,
         }
     finally:
         if show_progress:
