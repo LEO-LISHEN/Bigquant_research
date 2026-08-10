@@ -321,6 +321,8 @@ def calc_hml_r_std_nm(
 FACTOR = {
     "name": 'hml_r_std_nm',
     "func": calc_hml_r_std_nm,
+    "factor_type": "base",
+    "candidate_instances": {"5m": {"n_months": 5, "trading_days_per_month": 21}},
     "input_schema": {
         "required": {
             'date': {},

@@ -51,6 +51,7 @@ def calc_amount_relative_ma_nd(data, target_dates=None, as_of_date=None, window=
 
 
 FACTOR = {"name": "amount_relative_ma_nd", "func": calc_amount_relative_ma_nd,
+          "factor_type": "base", "candidate_instances": {"20d": {"window": 20}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "amount": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "window": {"default": 20}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_amount_relative_ma_nd_data_window, "default": _resolve_amount_relative_ma_nd_data_window({})},

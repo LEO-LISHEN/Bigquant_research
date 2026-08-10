@@ -51,6 +51,7 @@ def calc_volume_ratio_nd(data, target_dates=None, as_of_date=None, window=5, sho
 
 
 FACTOR = {"name": "volume_ratio_nd", "func": calc_volume_ratio_nd,
+          "factor_type": "base", "candidate_instances": {"5d": {"window": 5}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "volume": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "window": {"default": 5}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_volume_ratio_nd_data_window, "default": _resolve_volume_ratio_nd_data_window({})},

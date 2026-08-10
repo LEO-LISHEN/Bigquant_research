@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Sales_G_q：当季营业收入同比增长率成长因子。"""
+"""Profit_G_q：当季净利润同比增长率成长因子。"""
 
 import time
 
@@ -10,10 +10,10 @@ from factor_lib.common.preprocess.winsorize_mad import winsorize_mad
 from factor_lib.common.preprocess.zscore import zscore
 
 
-OUTPUT_COLUMNS = ["date", "instrument", "sales_g_q"]
+OUTPUT_COLUMNS = ["date", "instrument", "profit_g_q"]
 
 
-def calc_sales_g_q(
+def calc_profit_g_q(
     data,
     target_dates=None,
     as_of_date=None,
@@ -22,12 +22,12 @@ def calc_sales_g_q(
     show_progress=False,
     progress_every=20,
 ):
-    """计算 Sales_G_q 裸因子。
+    """计算 Profit_G_q 裸因子。
 
-    原始定义为最新可得财报的单季度营业收入同比增长率。
+    原始定义为最新可得财报的单季度净利润同比增长率。
     每个目标日独立执行：
 
-    单季度营业收入同比增长率
+    单季度净利润同比增长率
     → MAD 去极值
     → Z-score 标准化
 
@@ -57,12 +57,12 @@ def calc_sales_g_q(
     required_columns = {
         "date",
         "instrument",
-        "quarterly_operating_revenue_yoy",
+        "quarterly_net_profit_yoy",
     }
     missing_columns = required_columns - set(data.columns)
     if missing_columns:
         raise ValueError(
-            "sales_g_q 因子缺少字段："
+            "profit_g_q 因子缺少字段："
             f"{sorted(missing_columns)}"
         )
 
@@ -71,7 +71,7 @@ def calc_sales_g_q(
         [
             "date",
             "instrument",
-            "quarterly_operating_revenue_yoy",
+            "quarterly_net_profit_yoy",
         ],
     ].copy()
     df["date"] = pd.to_datetime(
@@ -79,10 +79,10 @@ def calc_sales_g_q(
         errors="coerce",
     ).dt.normalize()
     if df["date"].isna().any():
-        raise ValueError("sales_g_q 输入存在无效 date。")
+        raise ValueError("profit_g_q 输入存在无效 date。")
     if df["instrument"].isna().any():
         raise ValueError(
-            "sales_g_q 输入的 instrument 不允许缺失。"
+            "profit_g_q 输入的 instrument 不允许缺失。"
         )
 
     duplicated = df.duplicated(
@@ -100,16 +100,16 @@ def calc_sales_g_q(
             .to_dict("records")
         )
         raise ValueError(
-            "sales_g_q 输入存在重复 date + instrument："
+            "profit_g_q 输入存在重复 date + instrument："
             f"{examples}"
         )
 
-    df["quarterly_operating_revenue_yoy"] = pd.to_numeric(
-        df["quarterly_operating_revenue_yoy"],
+    df["quarterly_net_profit_yoy"] = pd.to_numeric(
+        df["quarterly_net_profit_yoy"],
         errors="coerce",
     )
-    df["quarterly_operating_revenue_yoy"] = df[
-        "quarterly_operating_revenue_yoy"
+    df["quarterly_net_profit_yoy"] = df[
+        "quarterly_net_profit_yoy"
     ].replace([np.inf, -np.inf], np.nan)
 
     if as_of_date is not None:
@@ -149,7 +149,7 @@ def calc_sales_g_q(
             for date in missing_target_dates[:5]
         ]
         raise ValueError(
-            "sales_g_q 缺少目标日财务截面："
+            "profit_g_q 缺少目标日财务截面："
             f"{preview}。请检查财务适配器日期和 as_of_date。"
         )
 
@@ -160,7 +160,7 @@ def calc_sales_g_q(
 
     if show_progress:
         print(
-            f"\r[sales_g_q] 0/{total_dates} 个截面 | 0.0%",
+            f"\r[profit_g_q] 0/{total_dates} 个截面 | 0.0%",
             end="",
             flush=True,
         )
@@ -172,7 +172,7 @@ def calc_sales_g_q(
         ):
             cross_section = df.loc[df["date"] == date].copy()
             raw_factor = cross_section[
-                "quarterly_operating_revenue_yoy"
+                "quarterly_net_profit_yoy"
             ].astype(float)
             valid_count = int(raw_factor.notna().sum())
 
@@ -213,7 +213,7 @@ def calc_sales_g_q(
                         "instrument": cross_section[
                             "instrument"
                         ].to_numpy(),
-                        "sales_g_q": factor.to_numpy(),
+                        "profit_g_q": factor.to_numpy(),
                     }
                 )
             )
@@ -231,7 +231,7 @@ def calc_sales_g_q(
                 )
                 print(
                     "\r"
-                    f"[sales_g_q] {position}/{total_dates} 个截面 "
+                    f"[profit_g_q] {position}/{total_dates} 个截面 "
                     f"| {position / total_dates:.1%} "
                     f"| 当前：{date:%Y-%m-%d} "
                     f"| 有效样本：{valid_count:,} "
@@ -258,13 +258,15 @@ def calc_sales_g_q(
 
 
 FACTOR = {
-    "name": 'sales_g_q',
-    "func": calc_sales_g_q,
+    "name": 'profit_g_q',
+    "func": calc_profit_g_q,
+    "factor_type": "base",
+    "candidate_instances": {"default": {}},
     "input_schema": {
         "required": {
             'date': {},
             'instrument': {},
-            'quarterly_operating_revenue_yoy': {},
+            'quarterly_net_profit_yoy': {},
         },
         "conditional": {
         },
@@ -286,17 +288,17 @@ FACTOR = {
     "output_schema": {
         'date': {},
         'instrument': {},
-        'sales_g_q': {},
+        'profit_g_q': {},
     },
 }
 
 
 FACTOR_INFO = """
-# Sales_G_q（单季营业收入同比增长）
+# Profit_G_q（单季净利润同比增长）
 
-使用目标日已可得的最新单季营业收入同比增速，做截面去极值和标准化。数值越高，代表主营收入增长越快。
+使用目标日已可得的最新单季净利润同比增速，做截面去极值和标准化。数值越高，代表近期利润增长越快。
 
-- **计算**：直接使用点时财务字段 `quarterly_operating_revenue_yoy`。
-- **时点**：必须按财报真实可得时间对齐，避免财务披露前视。
-- **研究提示**：收入增长不等同于利润改善，宜与盈利质量类因子联合使用。
+- **计算**：直接使用点时财务字段 `quarterly_net_profit_yoy`。
+- **时点**：必须按财报真实可得时间对齐，不能按报告期末提前填充。
+- **研究提示**：该版本不做市值或行业中性化，宜结合行业暴露一并检验。
 """

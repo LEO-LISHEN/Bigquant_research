@@ -51,6 +51,7 @@ def calc_price_ma_distance_nd(data, target_dates=None, as_of_date=None, window=5
 
 
 FACTOR = {"name": "price_ma_distance_nd", "func": calc_price_ma_distance_nd,
+          "factor_type": "base", "candidate_instances": {"5d": {"window": 5}, "10d": {"window": 10}, "20d": {"window": 20}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "close": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "window": {"default": 5}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_price_ma_distance_nd_data_window, "default": _resolve_price_ma_distance_nd_data_window({})},

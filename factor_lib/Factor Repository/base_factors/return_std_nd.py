@@ -50,6 +50,7 @@ def calc_return_std_nd(data, target_dates=None, as_of_date=None, window=5, show_
 
 
 FACTOR = {"name": "return_std_nd", "func": calc_return_std_nd,
+          "factor_type": "base", "candidate_instances": {"5d": {"window": 5}, "20d": {"window": 20}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "close": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "window": {"default": 5}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_return_std_nd_data_window, "default": _resolve_return_std_nd_data_window({})},

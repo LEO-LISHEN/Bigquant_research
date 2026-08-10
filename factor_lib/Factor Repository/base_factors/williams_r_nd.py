@@ -53,6 +53,7 @@ def calc_williams_r_nd(data, target_dates=None, as_of_date=None, window=14, show
 
 
 FACTOR = {"name": "williams_r_nd", "func": calc_williams_r_nd,
+          "factor_type": "base", "candidate_instances": {"14d": {"window": 14}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "high": {}, "low": {}, "close": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "window": {"default": 14}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_williams_r_nd_data_window, "default": _resolve_williams_r_nd_data_window({})},

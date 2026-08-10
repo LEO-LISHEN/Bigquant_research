@@ -60,6 +60,7 @@ def calc_high_relative_return(data, target_dates=None, as_of_date=None, show_pro
 
 FACTOR = {
     "name": "high_relative_return", "func": calc_high_relative_return,
+    "factor_type": "base", "candidate_instances": {"default": {}},
     "input_schema": {"required": {"date": {}, "instrument": {}, "high": {}, "close": {}}, "conditional": {}},
     "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
     "data_window": {"resolver": _resolve_high_relative_return_data_window, "default": _resolve_high_relative_return_data_window({})},

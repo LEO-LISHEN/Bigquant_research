@@ -58,6 +58,7 @@ def calc_macd_hist_relative(data, target_dates=None, as_of_date=None, fast_windo
 
 
 FACTOR = {"name": "macd_hist_relative", "func": calc_macd_hist_relative,
+          "factor_type": "base", "candidate_instances": {"12_26_9": {"fast_window": 12, "slow_window": 26, "signal_window": 9, "warmup_multiplier": 5}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "close": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "fast_window": {"default": 12}, "slow_window": {"default": 26}, "signal_window": {"default": 9}, "warmup_multiplier": {"default": 5}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_macd_hist_relative_data_window, "default": _resolve_macd_hist_relative_data_window({})},

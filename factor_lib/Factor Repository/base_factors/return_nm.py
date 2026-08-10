@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""华泰换手率加权 N 月收益因子。"""
+"""华泰 N 月区间收益因子。"""
 
 import time
 
@@ -7,10 +7,10 @@ import numpy as np
 import pandas as pd
 
 
-OUTPUT_COLUMNS = ["date", "instrument", "wgt_return_nm"]
+OUTPUT_COLUMNS = ["date", "instrument", "return_nm"]
 
 
-def _resolve_wgt_return_nm_data_window(resolved_params):
+def _resolve_return_nm_data_window(resolved_params):
     """根据本次完整因子参数返回确定的数据窗口。"""
     n_months = resolved_params.get("n_months", 1)
     trading_days_per_month = resolved_params.get(
@@ -43,7 +43,7 @@ def _resolve_wgt_return_nm_data_window(resolved_params):
     }
 
 
-def calc_wgt_return_nm(
+def calc_return_nm(
     data,
     target_dates=None,
     as_of_date=None,
@@ -52,21 +52,18 @@ def calc_wgt_return_nm(
     show_progress=False,
     progress_every=200,
 ):
-    """计算换手率加权 N 月收益因子。
+    """计算 N 月区间收益因子。
 
-    对最近 ``n_months * trading_days_per_month`` 个交易日的每日收益率，
-    使用当日换手率加权：
+    ``factor_t = close_t / close_{t-L} - 1``
 
-    ``factor_t = sum(ret_{t-i} * turn_{t-i})
-                  / sum(turn_{t-i})``
-
-    原华泰 ``wgt_return_1m`` 对应 ``n_months=1``。数值越低的股票在
-    原华泰研究中表现越好。本函数不负责数据查询或任何策略逻辑。
+    其中 ``L = n_months * trading_days_per_month``。原华泰
+    ``return_1m`` 对应 ``n_months=1``。数值越低的股票在原华泰
+    研究中表现越好。本函数不负责数据查询或任何策略逻辑。
 
     参数
     ----
     data : pandas.DataFrame
-        必须包含 date、instrument、close、turn，并包含历史预热数据。
+        必须包含 date、instrument、close，并包含历史预热数据。
     target_dates : 日期或日期序列，可选
         只输出这些目标截面。为 None 时输出 data 中全部日期。
     as_of_date : 日期，可选
@@ -83,12 +80,12 @@ def calc_wgt_return_nm(
     返回
     ----
     pandas.DataFrame
-        date、instrument、wgt_return_nm 三列。历史不足或权重和为 0
-        的记录保留为 NaN。
+        date、instrument、return_nm 三列。历史不足或价格无效的记录
+        保留为 NaN。
     """
     if not isinstance(data, pd.DataFrame):
         raise TypeError("data 必须是 pandas.DataFrame。")
-    resolved_window = _resolve_wgt_return_nm_data_window(
+    resolved_window = _resolve_return_nm_data_window(
         {
             "n_months": n_months,
             "trading_days_per_month": trading_days_per_month,
@@ -104,24 +101,24 @@ def calc_wgt_return_nm(
     ):
         raise ValueError("progress_every 必须是正整数。")
 
-    required_columns = {"date", "instrument", "close", "turn"}
+    required_columns = {"date", "instrument", "close"}
     missing_columns = required_columns - set(data.columns)
     if missing_columns:
         raise ValueError(
-            "wgt_return_nm 因子缺少字段："
+            "return_nm 因子缺少字段："
             f"{sorted(missing_columns)}"
         )
 
-    df = data.loc[:, ["date", "instrument", "close", "turn"]].copy()
+    df = data.loc[:, ["date", "instrument", "close"]].copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if df["date"].isna().any():
         raise ValueError(
-            "wgt_return_nm 因子的 date "
+            "return_nm 因子的 date "
             "存在无法解析的日期或缺失值。"
         )
     if df["instrument"].isna().any():
         raise ValueError(
-            "wgt_return_nm 因子的 instrument 不允许缺失。"
+            "return_nm 因子的 instrument 不允许缺失。"
         )
 
     duplicated = df.duplicated(
@@ -136,12 +133,11 @@ def calc_wgt_return_nm(
             .to_dict("records")
         )
         raise ValueError(
-            "wgt_return_nm 因子输入存在重复的 "
+            "return_nm 因子输入存在重复的 "
             f"date + instrument 记录：{examples}"
         )
 
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["turn"] = pd.to_numeric(df["turn"], errors="coerce")
 
     if as_of_date is not None:
         as_of_timestamp = pd.Timestamp(as_of_date)
@@ -181,7 +177,7 @@ def calc_wgt_return_nm(
                 for date in missing_target_dates[:5]
             ]
             raise ValueError(
-                "wgt_return_nm 因子缺少目标日期的原始数据："
+                "return_nm 因子缺少目标日期的原始数据："
                 f"{preview}。请检查数据范围和 as_of_date。"
             )
 
@@ -196,8 +192,7 @@ def calc_wgt_return_nm(
     if show_progress:
         print(
             "\r"
-            f"[wgt_return_nm] 0/{total_instruments} 只股票 "
-            "| 0.0%",
+            f"[return_nm] 0/{total_instruments} 只股票 | 0.0%",
             end="",
             flush=True,
         )
@@ -213,59 +208,16 @@ def calc_wgt_return_nm(
                 kind="mergesort",
             ).copy()
             close = stock_data["close"].to_numpy(dtype=float)
-            turn = stock_data["turn"].to_numpy(dtype=float)
             row_count = len(stock_data)
 
-            previous_close = np.empty(row_count, dtype=float)
-            previous_close[:] = np.nan
-            if row_count > 1:
-                previous_close[1:] = close[:-1]
-
-            daily_return = np.full(row_count, np.nan, dtype=float)
-            valid_price = (
-                np.isfinite(close)
-                & np.isfinite(previous_close)
-                & (previous_close != 0)
+            historical_close = np.full(
+                row_count,
+                np.nan,
+                dtype=float,
             )
-            daily_return[valid_price] = (
-                close[valid_price]
-                / previous_close[valid_price]
-                - 1.0
-            )
-
-            valid_turn = np.isfinite(turn)
-            denominator_input = np.where(
-                valid_turn,
-                turn,
-                0.0,
-            )
-            numerator_input = np.where(
-                valid_turn & np.isfinite(daily_return),
-                turn * daily_return,
-                0.0,
-            )
-
-            numerator_prefix = np.concatenate(
-                ([0.0], np.cumsum(numerator_input))
-            )
-            denominator_prefix = np.concatenate(
-                ([0.0], np.cumsum(denominator_input))
-            )
-            numerator = numerator_prefix[1:].copy()
-            denominator = denominator_prefix[1:].copy()
-
             if row_count > lookback_days:
-                numerator[lookback_days:] = (
-                    numerator_prefix[lookback_days + 1 :]
-                    - numerator_prefix[
-                        1 : row_count - lookback_days + 1
-                    ]
-                )
-                denominator[lookback_days:] = (
-                    denominator_prefix[lookback_days + 1 :]
-                    - denominator_prefix[
-                        1 : row_count - lookback_days + 1
-                    ]
+                historical_close[lookback_days:] = (
+                    close[:-lookback_days]
                 )
 
             factor_values = np.full(
@@ -273,24 +225,22 @@ def calc_wgt_return_nm(
                 np.nan,
                 dtype=float,
             )
-            history_ready = (
-                np.arange(row_count) >= lookback_days
+            calculable = (
+                np.isfinite(close)
+                & np.isfinite(historical_close)
+                & (historical_close != 0)
             )
-            valid_denominator = (
-                np.isfinite(denominator)
-                & (denominator != 0)
-            )
-            calculable = history_ready & valid_denominator
             factor_values[calculable] = (
-                numerator[calculable]
-                / denominator[calculable]
+                close[calculable]
+                / historical_close[calculable]
+                - 1.0
             )
 
             stock_result = pd.DataFrame(
                 {
                     "date": stock_data["date"].to_numpy(),
                     "instrument": instrument,
-                    "wgt_return_nm": factor_values,
+                    "return_nm": factor_values,
                 }
             )
             stock_result = stock_result.loc[
@@ -312,7 +262,7 @@ def calc_wgt_return_nm(
                 )
                 print(
                     "\r"
-                    f"[wgt_return_nm] "
+                    f"[return_nm] "
                     f"{position}/{total_instruments} 只股票 "
                     f"| {position / total_instruments:.1%} "
                     f"| 当前：{instrument} "
@@ -336,14 +286,15 @@ def calc_wgt_return_nm(
 
 
 FACTOR = {
-    "name": 'wgt_return_nm',
-    "func": calc_wgt_return_nm,
+    "name": 'return_nm',
+    "func": calc_return_nm,
+    "factor_type": "base",
+    "candidate_instances": {"1m": {"n_months": 1, "trading_days_per_month": 21}},
     "input_schema": {
         "required": {
             'date': {},
             'instrument': {},
             'close': {},
-            'turn': {},
         },
         "conditional": {
         },
@@ -357,7 +308,7 @@ FACTOR = {
         'progress_every': {"default": 200},
     },
     "data_window": {
-        "resolver": _resolve_wgt_return_nm_data_window,
+        "resolver": _resolve_return_nm_data_window,
         "default": {
             "lookback_trading_days": 21,
             "requires_target_date_data": True,
@@ -368,17 +319,17 @@ FACTOR = {
     "output_schema": {
         'date': {},
         'instrument': {},
-        'wgt_return_nm': {},
+        'return_nm': {},
     },
 }
 
 
 FACTOR_INFO = """
-# 换手率加权收益（N 月）
+# 区间收益（N 月）
 
-对近 N 个月日收益率按当日换手率加权，保留原研究中的排序口径：数值较低通常更优。
+计算近 N 个月复权收盘价的区间收益，保留原研究中的排序口径：数值较低通常更优。
 
-- **计算**：以换手率为权重汇总窗口内日收益率。
-- **时点**：仅使用目标日及此前的复权收盘价和换手率。
+- **计算**：收益 = 目标日收盘价 / 窗口起点收盘价 - 1。
+- **时点**：整个窗口必须使用一致的复权价格口径，且不使用未来行情。
 - **推荐实例**：`n_months=1`，即原 1 个月版本。
 """

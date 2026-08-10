@@ -238,6 +238,8 @@ def calc_book_to_price(
 FACTOR = {
     "name": 'book_to_price',
     "func": calc_book_to_price,
+    "factor_type": "base",
+    "candidate_instances": {"default": {}},
     "input_schema": {
         "required": {
             'date': {},

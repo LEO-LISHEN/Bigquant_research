@@ -51,6 +51,7 @@ def calc_return_nd(data, target_dates=None, as_of_date=None, window=1, show_prog
 
 
 FACTOR = {"name": "return_nd", "func": calc_return_nd,
+          "factor_type": "base", "candidate_instances": {"1d": {"window": 1}, "5d": {"window": 5}, "10d": {"window": 10}, "20d": {"window": 20}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "close": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "window": {"default": 1}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_return_nd_data_window, "default": _resolve_return_nd_data_window({})},

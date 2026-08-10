@@ -73,6 +73,7 @@ def calc_open_gap(data, target_dates=None, as_of_date=None, show_progress=False,
 
 FACTOR = {
     "name": "open_gap", "func": calc_open_gap,
+    "factor_type": "base", "candidate_instances": {"default": {}},
     "input_schema": {"required": {"date": {}, "instrument": {}, "open": {}, "close": {}}, "conditional": {}},
     "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
     "data_window": {"resolver": _resolve_open_gap_data_window, "default": _resolve_open_gap_data_window({})},

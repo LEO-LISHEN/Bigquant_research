@@ -54,6 +54,7 @@ def calc_volume_ma_ratio_nd(data, target_dates=None, as_of_date=None, short_wind
 
 
 FACTOR = {"name": "volume_ma_ratio_nd", "func": calc_volume_ma_ratio_nd,
+          "factor_type": "base", "candidate_instances": {"5d_20d": {"short_window": 5, "long_window": 20}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "volume": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "short_window": {"default": 5}, "long_window": {"default": 20}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_volume_ma_ratio_nd_data_window, "default": _resolve_volume_ma_ratio_nd_data_window({})},

@@ -368,6 +368,8 @@ def calc_mfd_sellamt_nd(
 FACTOR = {
     "name": 'mfd_sellamt_nd',
     "func": calc_mfd_sellamt_nd,
+    "factor_type": "base",
+    "candidate_instances": {"1d": {"n_days": 1}},
     "input_schema": {
         "required": {
             'date': {},

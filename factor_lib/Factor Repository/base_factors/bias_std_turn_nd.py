@@ -466,6 +466,8 @@ def calc_bias_std_turn_nd(
 FACTOR = {
     "name": 'bias_std_turn_nd',
     "func": calc_bias_std_turn_nd,
+    "factor_type": "base",
+    "candidate_instances": {"5d": {"short_window": 5}},
     "input_schema": {
         "required": {
             'date': {},

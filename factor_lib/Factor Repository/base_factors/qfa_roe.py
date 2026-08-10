@@ -342,6 +342,8 @@ def calc_qfa_roe(
 FACTOR = {
     "name": 'qfa_roe',
     "func": calc_qfa_roe,
+    "factor_type": "base",
+    "candidate_instances": {"default": {}},
     "input_schema": {
         "required": {
             'date': {},

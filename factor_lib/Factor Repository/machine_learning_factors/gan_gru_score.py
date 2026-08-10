@@ -2212,6 +2212,7 @@ def build_model_state_provider(
 FACTOR = {
     "name": "gan_gru_score",
     "func": calc_gan_gru_score,
+    "factor_type": "machine_learning",
     "input_schema": {
         "required": {"date": {}, "instrument": {}},
         "conditional": {},

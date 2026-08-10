@@ -57,6 +57,7 @@ def calc_rsi_nd(data, target_dates=None, as_of_date=None, window=14, show_progre
 
 
 FACTOR = {"name": "rsi_nd", "func": calc_rsi_nd,
+          "factor_type": "base", "candidate_instances": {"14d": {"window": 14}},
           "input_schema": {"required": {"date": {}, "instrument": {}, "close": {}}, "conditional": {}},
           "parameters": {"target_dates": {"default": None}, "as_of_date": {"default": None}, "window": {"default": 14}, "show_progress": {"default": False}, "progress_every": {"default": 20}},
           "data_window": {"resolver": _resolve_rsi_nd_data_window, "default": _resolve_rsi_nd_data_window({})},
