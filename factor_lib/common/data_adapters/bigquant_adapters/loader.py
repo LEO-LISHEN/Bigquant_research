@@ -188,6 +188,94 @@ def _resolve_factor_data_window(metadata, resolved_params):
     return resolved_window
 
 
+def _resolve_factor_dependencies(metadata, resolved_params):
+    """解析当前因子明确声明的直接依赖，不执行递归计算。"""
+    specification = metadata.get("dependencies")
+    if specification is None:
+        return None
+    if not isinstance(specification, Mapping):
+        raise ValueError("FACTOR['dependencies'] 必须是字典。")
+
+    resolver = specification.get("resolver")
+    if not callable(resolver):
+        raise ValueError("dependencies.resolver 必须是可调用函数。")
+    resolved = resolver(dict(resolved_params))
+    if not isinstance(resolved, Mapping):
+        raise ValueError("dependencies.resolver 必须返回字典。")
+
+    sequence_length = _normalize_nonnegative_integer(
+        resolved.get("sequence_length"),
+        "dependencies.sequence_length",
+    )
+    if sequence_length < 1:
+        raise ValueError("dependencies.sequence_length 必须至少为 1。")
+
+    items = resolved.get("items")
+    if not isinstance(items, (list, tuple)) or not items:
+        raise ValueError("dependencies.items 必须是非空列表。")
+
+    normalized_items = []
+    feature_names = set()
+    for position, item in enumerate(items, start=1):
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                f"第 {position} 个依赖定义必须是字典。"
+            )
+        factor_name = item.get("factor_name")
+        feature_name = item.get("feature_name")
+        factor_params = item.get("factor_params", {})
+        if not isinstance(factor_name, str) or not factor_name.strip():
+            raise ValueError(
+                f"第 {position} 个依赖缺少有效 factor_name。"
+            )
+        if not isinstance(feature_name, str) or not feature_name.strip():
+            raise ValueError(
+                f"第 {position} 个依赖缺少有效 feature_name。"
+            )
+        factor_name = factor_name.strip()
+        feature_name = feature_name.strip()
+        if feature_name in feature_names:
+            raise ValueError(f"feature_name 重复：{feature_name!r}。")
+        if not isinstance(factor_params, Mapping):
+            raise TypeError(
+                f"依赖 {feature_name!r} 的 factor_params 必须是字典。"
+            )
+
+        child_metadata = get_factor_metadata(factor_name)
+        if child_metadata.get("dependencies") is not None:
+            raise NotImplementedError(
+                f"当前只支持一层直接依赖；{factor_name!r} 本身仍有依赖。"
+            )
+        child_params = _resolved_factor_parameters(
+            child_metadata,
+            dict(factor_params),
+        )
+        child_window = _resolve_factor_data_window(
+            child_metadata,
+            child_params,
+        )
+        if not child_window["requires_target_date_data"]:
+            raise NotImplementedError(
+                f"当前复合因子依赖要求目标日数据；{factor_name!r} "
+                "声明 requires_target_date_data=False。"
+            )
+        normalized_items.append(
+            {
+                "factor_name": factor_name,
+                "feature_name": feature_name,
+                "factor_params": dict(factor_params),
+                "resolved_factor_params": child_params,
+                "data_window": child_window,
+            }
+        )
+        feature_names.add(feature_name)
+
+    return {
+        "sequence_length": sequence_length,
+        "items": normalized_items,
+    }
+
+
 def _normalize_adapter_registry(adapter_overrides=None):
     registry = {
         name: {"loader": item["loader"], "spec": dict(item["spec"])}
@@ -317,6 +405,10 @@ def get_factor_data_requirements(
     registry = _normalize_adapter_registry(adapter_overrides)
     catalog = _build_field_catalog(registry)
     resolved_params = _resolved_factor_parameters(metadata, factor_params)
+    resolved_dependencies = _resolve_factor_dependencies(
+        metadata,
+        resolved_params,
+    )
     fields_by_adapter = defaultdict(list)
 
     required_schema = schema.get("required", {})
@@ -345,7 +437,7 @@ def get_factor_data_requirements(
         ):
             fields_by_adapter[adapter_name].append(field_name)
 
-    if not fields_by_adapter:
+    if not fields_by_adapter and resolved_dependencies is None:
         raise ValueError(
             f"因子 {factor_name!r} 没有可加载的非主键原始字段。"
         )
@@ -364,6 +456,7 @@ def get_factor_data_requirements(
         "fields_by_frequency": dict(normalized_fields),
         "data_window": resolved_window,
         "resolved_factor_params": resolved_params,
+        "dependencies": resolved_dependencies,
     }
 
 
@@ -469,6 +562,233 @@ def _render_loader_progress(
     print(message.ljust(180), end="", flush=True)
 
 
+def load_trading_dates(start_date, end_date):
+    """读取闭区间内的 A 股交易日；仅返回标准化日期索引。"""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if pd.isna(start) or pd.isna(end):
+        raise ValueError("start_date 和 end_date 必须是有效日期。")
+    if start > end:
+        raise ValueError("start_date 不能晚于 end_date。")
+
+    import dai
+
+    sql = f"""
+    SELECT DISTINCT date
+    FROM cn_stock_bar1d
+    WHERE date BETWEEN '{start:%Y-%m-%d}' AND '{end:%Y-%m-%d}'
+    ORDER BY date
+    """
+    result = dai.query(
+        sql,
+        filters={
+            "date": [
+                start.strftime("%Y-%m-%d"),
+                end.strftime("%Y-%m-%d"),
+            ]
+        },
+    ).df()
+    if result.empty:
+        raise ValueError(
+            f"{start:%Y-%m-%d} 至 {end:%Y-%m-%d} 未查询到交易日。"
+        )
+    dates = pd.DatetimeIndex(
+        pd.to_datetime(result["date"], errors="raise")
+    ).normalize().unique().sort_values()
+    return dates
+
+
+def _normalize_final_target_dates(start_date, end_date, dates):
+    uses_range = start_date is not None or end_date is not None
+    uses_dates = dates is not None
+    if uses_range == uses_dates:
+        raise ValueError(
+            "日期选择必须二选一：start_date + end_date，或 dates。"
+        )
+    if uses_range:
+        if start_date is None or end_date is None:
+            raise ValueError("连续区间必须同时提供 start_date 和 end_date。")
+        return load_trading_dates(start_date, end_date)
+
+    if isinstance(dates, (str, pd.Timestamp, np.datetime64)):
+        dates = [dates]
+    normalized = pd.DatetimeIndex(
+        pd.to_datetime(list(dates), errors="raise")
+    ).normalize().unique().sort_values()
+    if len(normalized) == 0:
+        raise ValueError("dates 不能为空。")
+    return normalized
+
+
+def _load_calendar_covering_lookback(final_dates, required_history_days):
+    """取得覆盖最早最终目标日前足够交易日的轻量交易日历。"""
+    required_history_days = _normalize_nonnegative_integer(
+        required_history_days,
+        "required_history_days",
+    )
+    end = final_dates.max()
+    span_days = max(60, required_history_days * 2 + 30)
+
+    for _ in range(6):
+        start = final_dates.min() - pd.Timedelta(days=span_days)
+        calendar = load_trading_dates(start, end)
+        positions = {date: index for index, date in enumerate(calendar)}
+        missing = final_dates.difference(calendar)
+        if len(missing) > 0:
+            raise ValueError(
+                "最终目标日期包含非交易日："
+                f"{[date.strftime('%Y-%m-%d') for date in missing]}。"
+            )
+        earliest_position = min(positions[date] for date in final_dates)
+        if earliest_position >= required_history_days:
+            return calendar, positions
+        span_days *= 2
+
+    raise ValueError(
+        f"无法为最早目标日准备 {required_history_days} 个历史交易日。"
+    )
+
+
+def _load_dependent_factor_raw_data(
+    factor_name,
+    requirements,
+    start_date,
+    end_date,
+    dates,
+    instruments,
+    adapter_overrides,
+    show_progress,
+):
+    """按每个直接依赖自己的窗口加载原始数据，不做最大窗口广播。"""
+    dependency_spec = requirements["dependencies"]
+    final_dates = _normalize_final_target_dates(
+        start_date,
+        end_date,
+        dates,
+    )
+    sequence_length = dependency_spec["sequence_length"]
+    dependency_items = dependency_spec["items"]
+    maximum_lookback = max(
+        item["data_window"]["lookback_trading_days"]
+        for item in dependency_items
+    )
+    required_history = sequence_length - 1 + maximum_lookback
+    calendar, calendar_positions = _load_calendar_covering_lookback(
+        final_dates,
+        required_history,
+    )
+
+    dependencies = {}
+    dependency_target_dates = {}
+    dependency_raw_dates = {}
+    shell_parts = []
+    started_at = time.perf_counter()
+    total = len(dependency_items)
+
+    try:
+        for index, item in enumerate(dependency_items, start=1):
+            feature_name = item["feature_name"]
+            child_factor = item["factor_name"]
+            lookback = item["data_window"]["lookback_trading_days"]
+            per_target_feature_dates = {}
+            per_target_raw_dates = {}
+
+            for final_date in final_dates:
+                final_position = calendar_positions[final_date]
+                feature_start = final_position - sequence_length + 1
+                raw_start = feature_start - lookback
+                if raw_start < 0:
+                    raise ValueError(
+                        f"依赖 {feature_name!r} 在 {final_date:%Y-%m-%d} "
+                        "缺少足够历史交易日。"
+                    )
+                per_target_feature_dates[final_date] = calendar[
+                    feature_start: final_position + 1
+                ]
+                per_target_raw_dates[final_date] = calendar[
+                    raw_start: final_position + 1
+                ]
+
+            raw_dates = pd.DatetimeIndex(
+                [
+                    date
+                    for values in per_target_raw_dates.values()
+                    for date in values
+                ]
+            ).unique().sort_values()
+
+            if show_progress:
+                _render_loader_progress(
+                    index - 1,
+                    total,
+                    feature_name,
+                    started_at,
+                    stage=f"正在加载依赖因子 {child_factor}",
+                    detail=(
+                        f"{len(raw_dates)} 个日期，独立预热 {lookback} 日"
+                    ),
+                )
+
+            child_bundle = load_factor_raw_data(
+                factor_name=child_factor,
+                dates=raw_dates,
+                factor_params=item["resolved_factor_params"],
+                instruments=instruments,
+                adapter_overrides=adapter_overrides,
+                show_progress=False,
+            )
+            if child_bundle.dependency_names:
+                raise NotImplementedError(
+                    f"当前只支持一层依赖，{child_factor!r} 返回了嵌套依赖。"
+                )
+            if not child_bundle.has_domain("security_daily"):
+                raise ValueError(
+                    f"依赖因子 {child_factor!r} 没有 security_daily 数据域。"
+                )
+
+            dependencies[feature_name] = child_bundle
+            dependency_target_dates[feature_name] = (
+                per_target_feature_dates
+            )
+            dependency_raw_dates[feature_name] = per_target_raw_dates
+            security_keys = child_bundle.get_security_daily().loc[
+                lambda frame: frame["date"].isin(final_dates),
+                ["date", "instrument"],
+            ]
+            shell_parts.append(security_keys)
+
+            if show_progress:
+                _render_loader_progress(
+                    index,
+                    total,
+                    feature_name,
+                    started_at,
+                    stage="依赖数据加载完成",
+                    detail=f"{sum(child_bundle.row_counts().values()):,} 行",
+                )
+
+        shell = (
+            pd.concat(shell_parts, ignore_index=True)
+            .drop_duplicates(["date", "instrument"])
+            .sort_values(["date", "instrument"], kind="mergesort")
+            .reset_index(drop=True)
+        )
+        if shell.empty:
+            raise ValueError(
+                f"因子 {factor_name!r} 的依赖数据未覆盖任何最终目标截面。"
+            )
+        return FactorDataBundle(
+            {"security_daily": shell},
+            key_columns={"security_daily": ("date", "instrument")},
+            dependencies=dependencies,
+            dependency_target_dates=dependency_target_dates,
+            dependency_raw_dates=dependency_raw_dates,
+        )
+    finally:
+        if show_progress:
+            print()
+
+
 def load_factor_raw_data(
     factor_name,
     start_date=None,
@@ -491,6 +811,18 @@ def load_factor_raw_data(
         factor_params,
         adapter_overrides=adapter_overrides,
     )
+    if requirements["dependencies"] is not None:
+        return _load_dependent_factor_raw_data(
+            factor_name=factor_name,
+            requirements=requirements,
+            start_date=start_date,
+            end_date=end_date,
+            dates=dates,
+            instruments=instruments,
+            adapter_overrides=adapter_overrides,
+            show_progress=show_progress,
+        )
+
     resolved_params = requirements["resolved_factor_params"]
     items = list(requirements["fields_by_adapter"].items())
     started_at = time.perf_counter()

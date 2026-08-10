@@ -6,7 +6,13 @@ import inspect
 from factor_lib.factor_hub.discover_factors import discover_factors
 
 
-def get_factor(name, data, as_of_date=None, **params):
+def get_factor(
+    name,
+    data,
+    target_dates=None,
+    as_of_date=None,
+    **params,
+):
     """
     根据因子名称调用对应的计算函数。
 
@@ -40,6 +46,9 @@ def get_factor(name, data, as_of_date=None, **params):
             signature = None
         if signature is not None and "domain_data" in signature.parameters:
             call_params["domain_data"] = data
+
+    if target_dates is not None:
+        call_params["target_dates"] = target_dates
 
     if as_of_date is not None:
         call_params["as_of_date"] = as_of_date

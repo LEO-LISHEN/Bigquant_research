@@ -39,7 +39,14 @@ class FactorDataBundle:
     ``security_daily`` 的每只股票行上。
     """
 
-    def __init__(self, domains, key_columns=None):
+    def __init__(
+        self,
+        domains,
+        key_columns=None,
+        dependencies=None,
+        dependency_target_dates=None,
+        dependency_raw_dates=None,
+    ):
         if not isinstance(domains, Mapping):
             raise TypeError("domains 必须是数据域名称到DataFrame的映射。")
         if not domains:
@@ -73,10 +80,27 @@ class FactorDataBundle:
 
         self._domains = normalized_domains
         self._key_columns = normalized_keys
+        self._dependencies = self._validate_dependencies(dependencies)
+        self._dependency_target_dates = self._validate_dependency_date_maps(
+            dependency_target_dates,
+            "dependency_target_dates",
+        )
+        self._dependency_raw_dates = self._validate_dependency_date_maps(
+            dependency_raw_dates,
+            "dependency_raw_dates",
+        )
+        self._validate_dependency_metadata()
         self._build_date_indexes()
 
     @classmethod
-    def _from_validated_domains(cls, domains, key_columns):
+    def _from_validated_domains(
+        cls,
+        domains,
+        key_columns,
+        dependencies=None,
+        dependency_target_dates=None,
+        dependency_raw_dates=None,
+    ):
         """由已验证面板建立容器，避免日期裁剪后重复做全量校验。
 
         本方法仅供 ``select_dates`` 内部使用。裁剪结果来自已经通过
@@ -85,8 +109,78 @@ class FactorDataBundle:
         instance = cls.__new__(cls)
         instance._domains = dict(domains)
         instance._key_columns = dict(key_columns)
+        instance._dependencies = dict(dependencies or {})
+        instance._dependency_target_dates = dict(
+            dependency_target_dates or {}
+        )
+        instance._dependency_raw_dates = dict(
+            dependency_raw_dates or {}
+        )
         instance._build_date_indexes()
         return instance
+
+    @classmethod
+    def _validate_dependencies(cls, dependencies):
+        if dependencies is None:
+            return {}
+        if not isinstance(dependencies, Mapping):
+            raise TypeError("dependencies 必须是名称到 FactorDataBundle 的映射。")
+
+        normalized = {}
+        for dependency_name, bundle in dependencies.items():
+            name = cls._normalize_domain_name(dependency_name)
+            if not isinstance(bundle, cls):
+                raise TypeError(
+                    f"依赖 {name!r} 必须是 FactorDataBundle，"
+                    f"实际为 {type(bundle).__name__}。"
+                )
+            normalized[name] = bundle
+        return normalized
+
+    @classmethod
+    def _validate_dependency_date_maps(cls, date_maps, field_name):
+        if date_maps is None:
+            return {}
+        if not isinstance(date_maps, Mapping):
+            raise TypeError(f"{field_name} 必须是字典。")
+
+        normalized = {}
+        for dependency_name, per_target in date_maps.items():
+            name = cls._normalize_domain_name(dependency_name)
+            if not isinstance(per_target, Mapping):
+                raise TypeError(
+                    f"{field_name}[{name!r}] 必须是目标日到日期序列的字典。"
+                )
+            normalized_per_target = {}
+            for target_date, values in per_target.items():
+                target = pd.Timestamp(target_date).normalize()
+                normalized_per_target[target] = cls._normalize_dates(
+                    values,
+                    allow_empty=False,
+                )
+            normalized[name] = normalized_per_target
+        return normalized
+
+    def _validate_dependency_metadata(self):
+        dependency_names = set(self._dependencies)
+        target_names = set(self._dependency_target_dates)
+        raw_names = set(self._dependency_raw_dates)
+        if dependency_names != target_names or dependency_names != raw_names:
+            raise ValueError(
+                "dependencies、dependency_target_dates 与 dependency_raw_dates "
+                "必须包含完全相同的依赖名称。"
+            )
+
+        for dependency_name in dependency_names:
+            target_keys = set(
+                self._dependency_target_dates[dependency_name]
+            )
+            raw_keys = set(self._dependency_raw_dates[dependency_name])
+            if target_keys != raw_keys:
+                raise ValueError(
+                    f"依赖 {dependency_name!r} 的目标日期映射与原始日期映射"
+                    "键集合不一致。"
+                )
 
     @staticmethod
     def _normalize_domain_name(domain_name):
@@ -308,6 +402,10 @@ class FactorDataBundle:
     def domain_names(self):
         return tuple(self._domains)
 
+    @property
+    def dependency_names(self):
+        return tuple(self._dependencies)
+
     def has_domain(self, domain_name):
         return domain_name in self._domains
 
@@ -321,6 +419,33 @@ class FactorDataBundle:
 
     def get_security_daily(self):
         return self.get_domain("security_daily")
+
+    def has_dependency(self, dependency_name):
+        return dependency_name in self._dependencies
+
+    def get_dependency(self, dependency_name):
+        if dependency_name not in self._dependencies:
+            raise KeyError(
+                f"缺少因子依赖 {dependency_name!r}；当前依赖："
+                f"{list(self._dependencies)}。"
+            )
+        return self._dependencies[dependency_name]
+
+    def get_dependency_target_dates(self, dependency_name, final_dates):
+        """返回指定最终目标日对应的依赖因子计算截面日期。"""
+        self.get_dependency(dependency_name)
+        selected_final_dates = self._normalize_dates(final_dates)
+        mapping = self._dependency_target_dates[dependency_name]
+        missing = [date for date in selected_final_dates if date not in mapping]
+        if missing:
+            raise KeyError(
+                f"依赖 {dependency_name!r} 缺少最终目标日映射："
+                f"{[date.strftime('%Y-%m-%d') for date in missing]}。"
+            )
+        values = []
+        for final_date in selected_final_dates:
+            values.extend(mapping[final_date])
+        return pd.DatetimeIndex(values).unique().sort_values()
 
     def key_columns(self, domain_name):
         if domain_name not in self._key_columns:
@@ -350,7 +475,7 @@ class FactorDataBundle:
         )
 
     def select_dates(self, dates):
-        """对所有含date字段的数据域使用同一日期集合进行快速裁剪。"""
+        """裁剪最终目标日，同时保留各依赖自身所需的预热日期。"""
         selected_dates = self._normalize_dates(dates)
 
         selected_domains = {}
@@ -363,11 +488,46 @@ class FactorDataBundle:
                 selected_dates,
             )
 
+        selected_dependencies = {}
+        selected_dependency_targets = {}
+        selected_dependency_raw = {}
+        for dependency_name, bundle in self._dependencies.items():
+            target_mapping = self._dependency_target_dates[dependency_name]
+            raw_mapping = self._dependency_raw_dates[dependency_name]
+            missing = [
+                date
+                for date in selected_dates
+                if date not in target_mapping or date not in raw_mapping
+            ]
+            if missing:
+                raise KeyError(
+                    f"依赖 {dependency_name!r} 缺少最终目标日映射："
+                    f"{[date.strftime('%Y-%m-%d') for date in missing]}。"
+                )
+
+            raw_dates = []
+            for final_date in selected_dates:
+                raw_dates.extend(raw_mapping[final_date])
+            selected_dependencies[dependency_name] = bundle.select_dates(
+                pd.DatetimeIndex(raw_dates).unique().sort_values()
+            )
+            selected_dependency_targets[dependency_name] = {
+                final_date: target_mapping[final_date]
+                for final_date in selected_dates
+            }
+            selected_dependency_raw[dependency_name] = {
+                final_date: raw_mapping[final_date]
+                for final_date in selected_dates
+            }
+
         # 所有裁剪结果均来自已经验证的数据域，因此不重复执行日期解析、
         # 主键空值检查和重复值扫描；新容器只为裁剪结果建立轻量日期索引。
         return self._from_validated_domains(
             selected_domains,
             key_columns=self._key_columns,
+            dependencies=selected_dependencies,
+            dependency_target_dates=selected_dependency_targets,
+            dependency_raw_dates=selected_dependency_raw,
         )
 
     def with_domain(self, domain_name, panel, key_columns=None):
@@ -380,7 +540,13 @@ class FactorDataBundle:
             keys[name] = tuple(key_columns)
         elif name not in keys and name in DEFAULT_DOMAIN_KEYS:
             keys[name] = DEFAULT_DOMAIN_KEYS[name]
-        return FactorDataBundle(domains, key_columns=keys)
+        return FactorDataBundle(
+            domains,
+            key_columns=keys,
+            dependencies=self._dependencies,
+            dependency_target_dates=self._dependency_target_dates,
+            dependency_raw_dates=self._dependency_raw_dates,
+        )
 
     def as_dict(self):
         """返回浅复制的数据域字典；DataFrame本身不会被复制。"""
@@ -394,4 +560,6 @@ class FactorDataBundle:
             f"{name}={len(panel):,} rows"
             for name, panel in self._domains.items()
         )
+        if self._dependencies:
+            details += ", dependencies=" + ",".join(self._dependencies)
         return f"FactorDataBundle({details})"
