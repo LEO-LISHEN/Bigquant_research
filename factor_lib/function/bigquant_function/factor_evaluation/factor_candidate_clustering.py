@@ -102,6 +102,155 @@ def _normalize_instruments(instruments):
     return result
 
 
+def _normalize_universe(universe):
+    """标准化本候选因子管理函数支持的股票池配置。"""
+    if universe == "all_a":
+        return {"type": "all_a"}
+    if isinstance(universe, (list, tuple, set, frozenset)):
+        return {
+            "type": "custom",
+            "instruments": _normalize_instruments(universe),
+        }
+    if not isinstance(universe, Mapping):
+        raise TypeError("universe 必须是 'all_a'、股票代码序列或配置字典。")
+    universe_type = str(universe.get("type", "")).strip().lower()
+    if universe_type == "all_a":
+        return {"type": "all_a"}
+    if universe_type in {"custom", "custom_list"}:
+        return {
+            "type": "custom",
+            "instruments": _normalize_instruments(universe.get("instruments")),
+        }
+    if universe_type == "index":
+        return {
+            "type": "index",
+            "index_codes": _normalize_instruments(
+                universe.get("index_codes", universe.get("code"))
+            ),
+        }
+    raise ValueError("universe['type'] 仅支持 all_a、index、custom。")
+
+
+def _quote_sql_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _query_index_universe(index_codes, target_dates):
+    """读取每个目标日的历史指数成分股。"""
+    try:
+        import dai
+    except ImportError as exc:
+        raise ImportError("未能导入 dai；请在 BigQuant 环境运行。") from exc
+    target_dates = (
+        pd.DatetimeIndex(pd.to_datetime(target_dates))
+        .normalize()
+        .unique()
+        .sort_values()
+    )
+    if target_dates.empty:
+        raise ValueError("target_dates 不能为空。")
+    index_sql = ", ".join(_quote_sql_literal(code) for code in index_codes)
+    date_sql = ", ".join(
+        _quote_sql_literal(date.strftime("%Y-%m-%d"))
+        for date in target_dates
+    )
+    sql = f"""
+    SELECT date, instrument AS index_code, member_code AS instrument
+    FROM cn_stock_index_component
+    WHERE instrument IN ({index_sql})
+      AND date IN ({date_sql})
+    ORDER BY date, instrument, member_code
+    """
+    panel = dai.query(
+        sql,
+        filters={
+            "date": [
+                target_dates.min().strftime("%Y-%m-%d"),
+                target_dates.max().strftime("%Y-%m-%d"),
+            ]
+        },
+    ).df()
+    required = {"date", "index_code", "instrument"}
+    missing = required - set(panel.columns)
+    if missing:
+        raise ValueError(f"指数成分股查询结果缺少字段：{sorted(missing)}")
+    if panel.empty:
+        raise ValueError("未读取到目标日的指数历史成分股。")
+    panel = panel.loc[:, ["date", "instrument"]].copy()
+    panel["date"] = pd.to_datetime(
+        panel["date"], errors="coerce"
+    ).dt.normalize()
+    panel["instrument"] = panel["instrument"].astype("string").str.strip()
+    if panel["date"].isna().any() or panel["instrument"].isna().any():
+        raise ValueError("指数成分股数据包含无效 date 或 instrument。")
+    if (panel["instrument"] == "").any():
+        raise ValueError("指数成分股数据包含空 instrument。")
+    panel = panel.drop_duplicates().sort_values(
+        ["date", "instrument"]
+    ).reset_index(drop=True)
+    missing_dates = target_dates.difference(
+        pd.DatetimeIndex(panel["date"].unique())
+    )
+    if not missing_dates.empty:
+        preview = [date.strftime("%Y-%m-%d") for date in missing_dates[:5]]
+        raise ValueError(
+            "部分目标日未读取到指数历史成分股："
+            f"{preview}。请检查指数代码或日期覆盖。"
+        )
+    return panel
+
+
+def _resolve_universe_panel(universe, target_dates):
+    """解析为点时股票池面板及仅用于查询优化的代码并集。"""
+    target_dates = (
+        pd.DatetimeIndex(pd.to_datetime(target_dates))
+        .normalize()
+        .unique()
+        .sort_values()
+    )
+    if target_dates.empty:
+        raise ValueError("target_dates 不能为空。")
+    config = _normalize_universe(universe)
+    if config["type"] == "all_a":
+        return config, None, None
+    if config["type"] == "custom":
+        panel = pd.MultiIndex.from_product(
+            [target_dates, config["instruments"]],
+            names=["date", "instrument"],
+        ).to_frame(index=False)
+        return config, panel, config["instruments"]
+    if config["type"] == "index":
+        panel = _query_index_universe(config["index_codes"], target_dates)
+        return config, panel, sorted(panel["instrument"].unique().tolist())
+    raise RuntimeError(f"未处理的股票池类型：{config['type']}")
+
+
+def _filter_panel_to_universe(panel, universe_panel, panel_name):
+    """按目标日 date + instrument 股票池过滤评价面板。"""
+    if not isinstance(panel, pd.DataFrame):
+        raise TypeError(f"{panel_name} 必须是 pandas.DataFrame。")
+    required = {"date", "instrument"}
+    missing = required - set(panel.columns)
+    if missing:
+        raise ValueError(f"{panel_name} 缺少字段：{sorted(missing)}")
+    if universe_panel is None:
+        return panel.copy()
+    result = panel.copy()
+    result["date"] = pd.to_datetime(
+        result["date"], errors="coerce"
+    ).dt.normalize()
+    if result["date"].isna().any() or result["instrument"].isna().any():
+        raise ValueError(f"{panel_name} 含有无效 date 或 instrument。")
+    if result.duplicated(["date", "instrument"]).any():
+        raise ValueError(f"{panel_name} 存在重复 date + instrument。")
+    return result.merge(
+        universe_panel,
+        on=["date", "instrument"],
+        how="inner",
+        validate="one_to_one",
+    )
+
+
 def _render_progress(
     stage_number,
     stage_total,
@@ -438,6 +587,8 @@ def _evaluate_candidate_panel(
     candidate_id,
     candidate_position,
     candidate_total,
+    stage_number,
+    stage_total,
 ):
     required = {"date", "instrument", factor_column}
     missing = required - set(factor_data.columns)
@@ -483,8 +634,8 @@ def _evaluate_candidate_panel(
             or date_position == total_dates
         ):
             _render_progress(
-                3,
-                6,
+                stage_number,
+                stage_total,
                 f"计算候选实例 RankIC（第 {candidate_position}/{candidate_total} 个）",
                 started_at,
                 completed=date_position,
@@ -749,6 +900,7 @@ def _save_management_result(
     pair_counts,
     schedule,
     resolved_candidates,
+    universe_panel,
 ):
     """显式保存单个、机器与 LLM 均可读取的 JSON 研究报告。"""
     directory = Path(output_dir)
@@ -774,6 +926,9 @@ def _save_management_result(
         "group_ranking": _frame_records(ranking),
         "resolved_candidates": _frame_records(resolved_candidates),
         "evaluation_schedule": _frame_records(schedule),
+        "universe_panel": (
+            None if universe_panel is None else _frame_records(universe_panel)
+        ),
         "similarity_matrix": {
             "index": list(similarity.index),
             "columns": list(similarity.columns),
@@ -800,6 +955,7 @@ def cluster_and_rank_factor_candidates(
     holding_period_days,
     cluster_count,
     instruments=None,
+    universe=None,
     min_obs=30,
     hac_lags=None,
     significance_threshold=2.0,
@@ -828,8 +984,12 @@ def cluster_and_rank_factor_candidates(
     cluster_count : int
         期望分成的候选因子组数，不能超过展开后的候选实例数。
     instruments : sequence[str] or None
-        固定股票池；None 为适配器返回的全 A 股。动态指数成分股池将在策略层单独处理，
-        本函数不以当期成分股替代历史成分股。
+        固定股票池；None 为适配器返回的全 A 股。
+    universe : "all_a"、股票代码集合或 dict，可选
+        点时股票池定义。指数股票池例如
+        ``{"type": "index", "index_codes": ["000300.SH"]}``；每个信号日
+        仅使用当日历史成分股计算 RankIC 和因子暴露相似度。传入时不得再传
+        instruments。
     min_obs : int
         单截面计算 RankIC 的最小完整样本数。
     hac_lags : int or None
@@ -858,7 +1018,8 @@ def cluster_and_rank_factor_candidates(
         ``saved_result_path``：显式保存时生成的 JSON 文件路径，否则为 None；
         ``similarity_matrix``：聚类依据；
         ``pairwise_observation_count``：每对因子的有效共同截面数；
-        ``evaluation_schedule``、``heatmap_figure``、``heatmap_axis``。
+        ``evaluation_schedule``、``universe_config``、``universe_panel``、
+        ``heatmap_figure``、``heatmap_axis``。
 
     Notes
     -----
@@ -871,7 +1032,7 @@ def cluster_and_rank_factor_candidates(
     RankIC 符号，方便识别该因子在研究期内的实际方向。
     """
     started_at = time.perf_counter()
-    stage_total = 7 if save_result else 6
+    stage_total = 8 if save_result else 7
     try:
         start_date = _normalize_date(start_date, "start_date")
         end_date = _normalize_date(end_date, "end_date")
@@ -896,6 +1057,8 @@ def cluster_and_rank_factor_candidates(
             raise TypeError("save_result 必须为 bool。")
         if not isinstance(output_dir, (str, Path)):
             raise TypeError("output_dir 必须是路径字符串或 pathlib.Path。")
+        if universe is not None and instruments is not None:
+            raise ValueError("universe 与 instruments 互斥；请只指定一种股票池。")
         instruments = _normalize_instruments(instruments)
         candidates = _resolve_candidates(candidate_spec)
         if cluster_count > len(candidates):
@@ -918,18 +1081,46 @@ def cluster_and_rank_factor_candidates(
             holding_period_days,
         )
 
+        target_dates = pd.DatetimeIndex(schedule["date"])
         if show_progress:
             _render_progress(
                 2,
+                stage_total,
+                "读取并校验点时动态股票池" if universe is not None else "确认固定股票池范围",
+                started_at,
+                current=f"{len(schedule)} 个信号日",
+            )
+        if universe is None:
+            universe_config = (
+                {"type": "all_a"}
+                if instruments is None
+                else {"type": "custom", "instruments": instruments}
+            )
+            universe_panel = None
+            load_instruments = instruments
+        else:
+            universe_config, universe_panel, load_instruments = _resolve_universe_panel(
+                universe,
+                target_dates,
+            )
+
+        if show_progress:
+            _render_progress(
+                3,
                 stage_total,
                 "读取价格并构造未来收益标签",
                 started_at,
                 current=f"{len(schedule)} 个信号日，持有期 {holding_period_days} 日",
             )
-        label_data = _prepare_labels(schedule, instruments, show_progress)
+        label_data = _prepare_labels(schedule, load_instruments, show_progress)
+        label_data = _filter_panel_to_universe(
+            label_data,
+            universe_panel,
+            "label_data",
+        )
         if show_progress:
             _render_progress(
-                2,
+                3,
                 stage_total,
                 "未来收益标签构造完成",
                 started_at,
@@ -940,7 +1131,7 @@ def cluster_and_rank_factor_candidates(
 
         if show_progress:
             _render_progress(
-                3,
+                4,
                 stage_total,
                 "依次计算候选因子实例",
                 started_at,
@@ -949,7 +1140,6 @@ def cluster_and_rank_factor_candidates(
             )
 
         candidate_results = []
-        target_dates = pd.DatetimeIndex(schedule["date"])
         for position, candidate in enumerate(candidates, start=1):
             factor_name = candidate["factor_name"]
             metadata = get_factor_metadata(factor_name)
@@ -964,7 +1154,7 @@ def cluster_and_rank_factor_candidates(
             )
             if show_progress:
                 _render_progress(
-                    3,
+                    4,
                     stage_total,
                     "准备并计算候选因子实例",
                     started_at,
@@ -978,7 +1168,7 @@ def cluster_and_rank_factor_candidates(
                 factor_name=factor_name,
                 dates=factor_dates,
                 factor_params=params,
-                instruments=instruments,
+                instruments=load_instruments,
                 show_progress=show_progress,
             )
             factor_data = get_factor(
@@ -989,6 +1179,11 @@ def cluster_and_rank_factor_candidates(
                 **params,
                 show_progress=show_progress,
                 progress_every=progress_every,
+            )
+            factor_data = _filter_panel_to_universe(
+                factor_data,
+                universe_panel,
+                "factor_data",
             )
             factor_column = _factor_value_column(metadata, factor_name)
             evaluation = _evaluate_candidate_panel(
@@ -1003,11 +1198,13 @@ def cluster_and_rank_factor_candidates(
                 candidate["candidate_id"],
                 position,
                 len(candidates),
+                4,
+                stage_total,
             )
             candidate_results.append({**candidate, **evaluation})
             if show_progress:
                 _render_progress(
-                    3,
+                    4,
                     stage_total,
                     "候选因子实例计算完成",
                     started_at,
@@ -1018,7 +1215,7 @@ def cluster_and_rank_factor_candidates(
 
         if show_progress:
             _render_progress(
-                4,
+                5,
                 stage_total,
                 "计算候选因子两两暴露相似度",
                 started_at,
@@ -1047,7 +1244,7 @@ def cluster_and_rank_factor_candidates(
                     or pair_position == pair_total
                 ):
                     _render_progress(
-                        4,
+                        5,
                         stage_total,
                         "计算候选因子两两暴露相似度",
                         started_at,
@@ -1057,7 +1254,7 @@ def cluster_and_rank_factor_candidates(
                     )
 
         if show_progress:
-            _render_progress(5, stage_total, "层次聚类并进行组内排序", started_at)
+            _render_progress(6, stage_total, "层次聚类并进行组内排序", started_at)
         group_ids, leaf_order = _cluster_similarity(similarity, cluster_count)
         rows = []
         for result in candidate_results:
@@ -1147,7 +1344,7 @@ def cluster_and_rank_factor_candidates(
         axis = None
         if plot:
             if show_progress:
-                _render_progress(6, stage_total, "绘制并展示候选因子相似度热力图", started_at)
+                _render_progress(7, stage_total, "绘制并展示候选因子相似度热力图", started_at)
             figure, axis = _plot_similarity_heatmap(
                 similarity,
                 ordered_ids,
@@ -1173,7 +1370,7 @@ def cluster_and_rank_factor_candidates(
         saved_result_path = None
         if save_result:
             if show_progress:
-                _render_progress(7, stage_total, "保存候选因子管理 JSON 报告", started_at)
+                _render_progress(8, stage_total, "保存候选因子管理 JSON 报告", started_at)
             saved_result_path = _save_management_result(
                 output_dir=output_dir,
                 run_name=run_name,
@@ -1185,6 +1382,7 @@ def cluster_and_rank_factor_candidates(
                     "holding_period_days": holding_period_days,
                     "cluster_count": cluster_count,
                     "instruments": instruments,
+                    "universe": universe_config,
                     "min_obs": min_obs,
                     "hac_lags": hac_lags,
                     "significance_threshold": significance_threshold,
@@ -1196,6 +1394,7 @@ def cluster_and_rank_factor_candidates(
                 pair_counts=ordered_pair_counts,
                 schedule=schedule,
                 resolved_candidates=resolved_candidates,
+                universe_panel=universe_panel,
             )
         if display_results:
             _display_group_ranking(group_summary, ranking_display)
@@ -1221,6 +1420,8 @@ def cluster_and_rank_factor_candidates(
             "similarity_matrix": ordered_similarity,
             "pairwise_observation_count": ordered_pair_counts,
             "evaluation_schedule": schedule,
+            "universe_config": universe_config,
+            "universe_panel": universe_panel,
             "heatmap_figure": figure,
             "heatmap_axis": axis,
             "resolved_candidates": resolved_candidates,

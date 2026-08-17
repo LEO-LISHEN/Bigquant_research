@@ -13,6 +13,7 @@ import json
 import os
 import pickle
 import re
+import threading
 import time
 import uuid
 from collections.abc import Mapping, MutableMapping
@@ -237,6 +238,79 @@ def _print_training_progress(
         end="",
         flush=True,
     )
+
+
+def _print_feature_progress(
+    scope,
+    feature_index,
+    feature_total,
+    feature_name,
+    stage,
+    started_at,
+    *,
+    completed_features=0,
+    detail="",
+):
+    """输出 GAN-GRU 内部特征准备进度，不依赖子因子的日志实现。"""
+    elapsed = time.perf_counter() - started_at
+    parts = [
+        f"[{scope}] 特征 {feature_index}/{feature_total}",
+        f"当前 {feature_name}",
+        stage,
+    ]
+    if completed_features > 0:
+        ratio = completed_features / feature_total
+        parts.append(f"总完成度 {ratio:.1%}")
+        if completed_features < feature_total:
+            remaining = elapsed / completed_features * (
+                feature_total - completed_features
+            )
+            parts.append(f"预计剩余 {remaining:.1f}s")
+    if detail:
+        parts.append(str(detail))
+    parts.append(f"已耗时 {elapsed:.1f}s")
+    print("\r" + " | ".join(parts).ljust(220), end="", flush=True)
+
+
+def _run_feature_stage_with_heartbeat(
+    action,
+    *,
+    scope,
+    feature_index,
+    feature_total,
+    feature_name,
+    stage,
+    started_at,
+    show_progress,
+    completed_features,
+    detail="",
+):
+    """为不透明查询或单次因子计算提供两秒一次的“仍在运行”心跳。"""
+    if not show_progress:
+        return action()
+
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.wait(2.0):
+            _print_feature_progress(
+                scope,
+                feature_index,
+                feature_total,
+                feature_name,
+                f"{stage}（仍在运行）",
+                started_at,
+                completed_features=completed_features,
+                detail=detail,
+            )
+
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        return action()
+    finally:
+        stop.set()
+        worker.join(timeout=2.1)
 
 
 def _json_hash(value):
@@ -621,13 +695,37 @@ def _calculate_feature_panel(
                     f"依赖 {feature_name!r} 的序列日期与其他特征不一致。"
                 )
 
-            factor_result = get_factor(
-                item["factor_name"],
-                child_bundle,
-                target_dates=child_target_dates,
-                as_of_date=final_dates.max(),
-                show_progress=False,
-                **item["params"],
+            if show_progress:
+                _print_feature_progress(
+                    "gan_gru_score",
+                    index,
+                    total,
+                    feature_name,
+                    "准备预存的依赖数据",
+                    started_at,
+                    completed_features=index - 1,
+                    detail=f"{len(child_target_dates)} 个目标日",
+                )
+
+            factor_result = _run_feature_stage_with_heartbeat(
+                lambda: get_factor(
+                    item["factor_name"],
+                    child_bundle,
+                    target_dates=child_target_dates,
+                    as_of_date=final_dates.max(),
+                    show_progress=show_progress,
+                    progress_every=1,
+                    **item["params"],
+                ),
+                scope="gan_gru_score",
+                feature_index=index,
+                feature_total=total,
+                feature_name=feature_name,
+                stage="计算因子截面",
+                started_at=started_at,
+                show_progress=show_progress,
+                completed_features=index - 1,
+                detail=f"{len(child_target_dates)} 个目标日",
             )
             value_column = _factor_output_column(item["factor_name"])
             required = {"date", "instrument", value_column}
@@ -646,17 +744,31 @@ def _calculate_feature_panel(
             pieces.append(piece)
 
             if show_progress:
-                elapsed = time.perf_counter() - started_at
-                print(
-                    "\r[gan_gru_score] "
-                    f"特征计算 {index}/{total}，当前 {feature_name}，"
-                    f"耗时 {elapsed:.1f}s".ljust(150),
-                    end="",
-                    flush=True,
+                _print_feature_progress(
+                    "gan_gru_score",
+                    index,
+                    total,
+                    feature_name,
+                    "因子计算完成，已加入特征面板",
+                    started_at,
+                    completed_features=index,
+                    detail=f"{len(piece):,} 条因子记录",
                 )
 
         panel = pieces[0]
-        for piece in pieces[1:]:
+        merge_total = max(1, len(pieces) - 1)
+        for merge_index, piece in enumerate(pieces[1:], start=1):
+            if show_progress:
+                _print_feature_progress(
+                    "gan_gru_score",
+                    merge_index,
+                    merge_total,
+                    str(piece.columns[-1]),
+                    "合并并校验特征面板",
+                    started_at,
+                    completed_features=total,
+                    detail=f"合并 {merge_index}/{merge_total}",
+                )
             panel = panel.merge(
                 piece,
                 on=["date", "instrument"],
@@ -912,20 +1024,60 @@ def _load_training_features(
                     f"训练特征 {item['feature_name']!r} 缺少预热数据。"
                 )
             raw_dates = calendar[raw_start: final_target_position + 1]
-            raw_bundle = load_factor_raw_data(
-                factor_name=item["factor_name"],
-                dates=raw_dates,
-                factor_params=requirements["resolved_factor_params"],
-                instruments=instruments,
-                show_progress=False,
+            if show_progress:
+                _print_feature_progress(
+                    "GAN-GRU训练特征",
+                    index,
+                    total,
+                    item["feature_name"],
+                    "读取训练期原始数据",
+                    started_at,
+                    completed_features=index - 1,
+                    detail=(
+                        f"独立预热 {lookback} 日，"
+                        f"原始日期 {len(raw_dates)} 个"
+                    ),
+                )
+            raw_bundle = _run_feature_stage_with_heartbeat(
+                lambda: load_factor_raw_data(
+                    factor_name=item["factor_name"],
+                    dates=raw_dates,
+                    factor_params=requirements["resolved_factor_params"],
+                    instruments=instruments,
+                    show_progress=show_progress,
+                ),
+                scope="GAN-GRU训练特征",
+                feature_index=index,
+                feature_total=total,
+                feature_name=item["feature_name"],
+                stage="读取训练期原始数据",
+                started_at=started_at,
+                show_progress=show_progress,
+                completed_features=index - 1,
+                detail=(
+                    f"独立预热 {lookback} 日，"
+                    f"原始日期 {len(raw_dates)} 个"
+                ),
             )
-            values = get_factor(
-                item["factor_name"],
-                raw_bundle,
-                target_dates=feature_target_dates,
-                as_of_date=feature_target_dates.max(),
-                show_progress=False,
-                **item["params"],
+            values = _run_feature_stage_with_heartbeat(
+                lambda: get_factor(
+                    item["factor_name"],
+                    raw_bundle,
+                    target_dates=feature_target_dates,
+                    as_of_date=feature_target_dates.max(),
+                    show_progress=show_progress,
+                    progress_every=1,
+                    **item["params"],
+                ),
+                scope="GAN-GRU训练特征",
+                feature_index=index,
+                feature_total=total,
+                feature_name=item["feature_name"],
+                stage="计算训练期因子值",
+                started_at=started_at,
+                show_progress=show_progress,
+                completed_features=index - 1,
+                detail=f"{len(feature_target_dates)} 个目标日",
             )
             value_column = _factor_output_column(item["factor_name"])
             piece = values[["date", "instrument", value_column]].copy()
@@ -936,18 +1088,31 @@ def _load_training_features(
             pieces.append(piece)
 
             if show_progress:
-                elapsed = time.perf_counter() - started_at
-                print(
-                    "\r[GAN-GRU训练] "
-                    f"加载特征 {index}/{total}，当前 {item['feature_name']}，"
-                    f"独立预热 {lookback} 日，耗时 {elapsed:.1f}s"
-                    .ljust(160),
-                    end="",
-                    flush=True,
+                _print_feature_progress(
+                    "GAN-GRU训练特征",
+                    index,
+                    total,
+                    item["feature_name"],
+                    "训练期特征计算完成",
+                    started_at,
+                    completed_features=index,
+                    detail=f"独立预热 {lookback} 日，{len(piece):,} 条记录",
                 )
 
         panel = pieces[0]
-        for piece in pieces[1:]:
+        merge_total = max(1, len(pieces) - 1)
+        for merge_index, piece in enumerate(pieces[1:], start=1):
+            if show_progress:
+                _print_feature_progress(
+                    "GAN-GRU训练特征",
+                    merge_index,
+                    merge_total,
+                    str(piece.columns[-1]),
+                    "合并并校验训练特征面板",
+                    started_at,
+                    completed_features=total,
+                    detail=f"合并 {merge_index}/{merge_total}",
+                )
             panel = panel.merge(
                 piece,
                 on=["date", "instrument"],
@@ -2212,7 +2377,6 @@ def build_model_state_provider(
 FACTOR = {
     "name": "gan_gru_score",
     "func": calc_gan_gru_score,
-    "factor_type": "machine_learning",
     "input_schema": {
         "required": {"date": {}, "instrument": {}},
         "conditional": {},

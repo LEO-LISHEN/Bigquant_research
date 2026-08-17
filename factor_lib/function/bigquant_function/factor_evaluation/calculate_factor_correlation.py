@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import time
-import threading
 from collections.abc import Mapping, Sequence
 
 import numpy as np
@@ -140,76 +139,175 @@ def _normalize_instruments(instruments):
     return normalized
 
 
+def _normalize_universe(universe):
+    """标准化本评价函数支持的股票池配置。"""
+    if universe == "all_a":
+        return {"type": "all_a"}
+    if isinstance(universe, (list, tuple, set, frozenset)):
+        return {
+            "type": "custom",
+            "instruments": _normalize_instruments(universe),
+        }
+    if not isinstance(universe, Mapping):
+        raise TypeError("universe 必须是 'all_a'、股票代码序列或配置字典。")
+
+    universe_type = str(universe.get("type", "")).strip().lower()
+    if universe_type == "all_a":
+        return {"type": "all_a"}
+    if universe_type in {"custom", "custom_list"}:
+        return {
+            "type": "custom",
+            "instruments": _normalize_instruments(universe.get("instruments")),
+        }
+    if universe_type == "index":
+        return {
+            "type": "index",
+            "index_codes": _normalize_instruments(
+                universe.get("index_codes", universe.get("code"))
+            ),
+        }
+    raise ValueError("universe['type'] 仅支持 all_a、index、custom。")
+
+
+def _quote_sql_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _query_index_universe(index_codes, target_dates):
+    """读取每个目标日的历史指数成分股。"""
+    try:
+        import dai
+    except ImportError as exc:
+        raise ImportError("未能导入 dai；请在 BigQuant 环境运行。") from exc
+
+    target_dates = (
+        pd.DatetimeIndex(pd.to_datetime(target_dates))
+        .normalize()
+        .unique()
+        .sort_values()
+    )
+    if target_dates.empty:
+        raise ValueError("target_dates 不能为空。")
+    index_sql = ", ".join(_quote_sql_literal(code) for code in index_codes)
+    date_sql = ", ".join(
+        _quote_sql_literal(date.strftime("%Y-%m-%d"))
+        for date in target_dates
+    )
+    sql = f"""
+    SELECT date, instrument AS index_code, member_code AS instrument
+    FROM cn_stock_index_component
+    WHERE instrument IN ({index_sql})
+      AND date IN ({date_sql})
+    ORDER BY date, instrument, member_code
+    """
+    panel = dai.query(
+        sql,
+        filters={
+            "date": [
+                target_dates.min().strftime("%Y-%m-%d"),
+                target_dates.max().strftime("%Y-%m-%d"),
+            ]
+        },
+    ).df()
+    required = {"date", "index_code", "instrument"}
+    missing = required - set(panel.columns)
+    if missing:
+        raise ValueError(f"指数成分股查询结果缺少字段：{sorted(missing)}")
+    if panel.empty:
+        raise ValueError("未读取到目标日的指数历史成分股。")
+
+    panel = panel.loc[:, ["date", "instrument"]].copy()
+    panel["date"] = pd.to_datetime(
+        panel["date"], errors="coerce"
+    ).dt.normalize()
+    panel["instrument"] = panel["instrument"].astype("string").str.strip()
+    if panel["date"].isna().any() or panel["instrument"].isna().any():
+        raise ValueError("指数成分股数据包含无效 date 或 instrument。")
+    if (panel["instrument"] == "").any():
+        raise ValueError("指数成分股数据包含空 instrument。")
+    panel = panel.drop_duplicates().sort_values(
+        ["date", "instrument"]
+    ).reset_index(drop=True)
+    missing_dates = target_dates.difference(
+        pd.DatetimeIndex(panel["date"].unique())
+    )
+    if not missing_dates.empty:
+        preview = [date.strftime("%Y-%m-%d") for date in missing_dates[:5]]
+        raise ValueError(
+            "部分目标日未读取到指数历史成分股："
+            f"{preview}。请检查指数代码或日期覆盖。"
+        )
+    return panel
+
+
+def _resolve_universe_panel(universe, target_dates):
+    """解析为点时股票池面板及仅用于查询优化的代码并集。"""
+    target_dates = (
+        pd.DatetimeIndex(pd.to_datetime(target_dates))
+        .normalize()
+        .unique()
+        .sort_values()
+    )
+    if target_dates.empty:
+        raise ValueError("target_dates 不能为空。")
+    config = _normalize_universe(universe)
+    if config["type"] == "all_a":
+        return config, None, None
+    if config["type"] == "custom":
+        panel = pd.MultiIndex.from_product(
+            [target_dates, config["instruments"]],
+            names=["date", "instrument"],
+        ).to_frame(index=False)
+        return config, panel, config["instruments"]
+    if config["type"] == "index":
+        panel = _query_index_universe(config["index_codes"], target_dates)
+        return config, panel, sorted(panel["instrument"].unique().tolist())
+    raise RuntimeError(f"未处理的股票池类型：{config['type']}")
+
+
+def _filter_panel_to_universe(panel, universe_panel, panel_name):
+    """按目标日 date + instrument 股票池过滤评价面板。"""
+    if not isinstance(panel, pd.DataFrame):
+        raise TypeError(f"{panel_name} 必须是 pandas.DataFrame。")
+    required = {"date", "instrument"}
+    missing = required - set(panel.columns)
+    if missing:
+        raise ValueError(f"{panel_name} 缺少字段：{sorted(missing)}")
+    if universe_panel is None:
+        return panel.copy()
+    result = panel.copy()
+    result["date"] = pd.to_datetime(
+        result["date"], errors="coerce"
+    ).dt.normalize()
+    if result["date"].isna().any() or result["instrument"].isna().any():
+        raise ValueError(f"{panel_name} 含有无效 date 或 instrument。")
+    if result.duplicated(["date", "instrument"]).any():
+        raise ValueError(f"{panel_name} 存在重复 date + instrument。")
+    return result.merge(
+        universe_panel,
+        on=["date", "instrument"],
+        how="inner",
+        validate="one_to_one",
+    )
+
+
 def _render_progress(
     stage_number,
     stage_total,
     message,
     started_at,
-    completed=None,
-    total=None,
-    current=None,
 ):
     elapsed = time.perf_counter() - started_at
-    parts = [f"[因子相关性] [{stage_number}/{stage_total}] {message}"]
-    if completed is not None and total:
-        parts.append(f"{completed}/{total} ({completed / total:.1%})")
-        if 0 < completed < total:
-            remaining = elapsed / completed * (total - completed)
-            parts.append(f"预计剩余 {remaining:.1f}s")
-    if current is not None:
-        parts.append(f"当前 {current}")
-    parts.append(f"已耗时 {elapsed:.1f}s")
     print(
-        "\r" + " | ".join(parts).ljust(200),
+        "\r"
+        f"[因子相关性] [{stage_number}/{stage_total}] "
+        f"{message} | 已耗时 {elapsed:.1f}s",
         end="",
         flush=True,
     )
 
 
-def _run_with_stage_heartbeat(
-    action,
-    stage_number,
-    stage_total,
-    message,
-    started_at,
-    show_progress,
-    current=None,
-    interval_seconds=2.0,
-):
-    """外部阻塞任务运行时定时刷新阶段存活状态。"""
-    if not show_progress:
-        return action()
-
-    stop_event = threading.Event()
-
-    def heartbeat():
-        while not stop_event.wait(interval_seconds):
-            _render_progress(
-                stage_number,
-                stage_total,
-                f"{message}（仍在运行）",
-                started_at,
-                current=current,
-            )
-
-    worker = threading.Thread(
-        target=heartbeat,
-        name="factor-correlation-progress",
-        daemon=True,
-    )
-    worker.start()
-    try:
-        return action()
-    finally:
-        stop_event.set()
-        worker.join(timeout=max(interval_seconds, 0.1))
-
-
-def _query_trading_calendar(
-    end_date,
-    show_progress=False,
-    started_at=None,
-):
+def _query_trading_calendar(end_date):
     try:
         import dai
     except ImportError as exc:
@@ -223,17 +321,7 @@ def _query_trading_calendar(
     WHERE date <= '{end_date:%Y-%m-%d}'
     ORDER BY date
     """
-    if started_at is None:
-        started_at = time.perf_counter()
-    calendar = _run_with_stage_heartbeat(
-        lambda: dai.query(sql).df(),
-        1,
-        7,
-        "读取A股交易日历",
-        started_at,
-        show_progress,
-        current=f"截止{end_date:%Y-%m-%d}",
-    )
+    calendar = dai.query(sql).df()
     if calendar.empty or "date" not in calendar.columns:
         raise ValueError("未读取到有效的A股交易日历。")
 
@@ -346,10 +434,6 @@ def _load_one_factor(
     factor_params,
     instruments,
     progress_every,
-    show_progress,
-    started_at,
-    factor_position,
-    factor_total,
 ):
     metadata = get_factor_metadata(factor_name)
     requirements = get_factor_data_requirements(
@@ -371,56 +455,22 @@ def _load_one_factor(
         if name not in _RESERVED_FACTOR_PARAMS
     }
 
-    if show_progress:
-        _render_progress(
-            2,
-            7,
-            "逐因子加载原始数据",
-            started_at,
-            completed=factor_position - 1,
-            total=factor_total,
-            current=(
-                f"{factor_name}，所需日期{len(factor_dates)}个，"
-                f"预热{history_days}日"
-            ),
-        )
     raw_data = load_factor_raw_data(
         factor_name=factor_name,
         dates=factor_dates,
         factor_params=resolved_factor_params,
         instruments=instruments,
-        show_progress=show_progress,
+        show_progress=False,
     )
-    if show_progress:
-        row_count = sum(raw_data.row_counts().values())
-        _render_progress(
-            3,
-            7,
-            "逐因子计算目标截面",
-            started_at,
-            completed=factor_position - 1,
-            total=factor_total,
-            current=f"{factor_name}，各数据域合计{row_count:,}行",
-        )
     factor_data = get_factor(
         factor_name,
         raw_data,
         target_dates=target_dates,
         as_of_date=target_dates.max(),
         **resolved_factor_params,
-        show_progress=show_progress,
+        show_progress=False,
         progress_every=progress_every,
     )
-    if show_progress:
-        _render_progress(
-            3,
-            7,
-            "单个因子计算完成",
-            started_at,
-            completed=factor_position,
-            total=factor_total,
-            current=f"{factor_name}，结果{len(factor_data):,}行",
-        )
 
     factor_column = _resolve_factor_column(
         metadata,
@@ -481,6 +531,8 @@ def _calculate_correlation_from_panel(
     show_progress,
     progress_every,
     started_at,
+    stage_number,
+    stage_total,
 ):
     correlation_sum = pd.DataFrame(
         0.0,
@@ -522,13 +574,14 @@ def _calculate_correlation_from_panel(
         )
         if show_progress and should_refresh:
             _render_progress(
-                5,
-                7,
-                "逐截面计算相关矩阵",
+                stage_number,
+                stage_total,
+                (
+                    f"计算截面 {position}/{total_dates}"
+                    f"（{position / total_dates:.1%}），"
+                    f"当前 {date:%Y-%m-%d}"
+                ),
                 started_at,
-                completed=position,
-                total=total_dates,
-                current=f"{date:%Y-%m-%d}",
             )
 
     correlation_matrix = correlation_sum.divide(
@@ -632,6 +685,7 @@ def calculate_factor_correlation(
     factor_names,
     factor_params_by_name=None,
     instruments=None,
+    universe=None,
     method="spearman",
     min_obs=30,
     plot=True,
@@ -655,6 +709,10 @@ def calculate_factor_correlation(
         以因子名称为键、因子内部参数字典为值。
     instruments : sequence[str]、str 或 None
         固定股票范围；None 表示全部A股。
+    universe : "all_a"、股票代码集合或 dict，可选
+        点时股票池定义。指数股票池例如
+        ``{"type": "index", "index_codes": ["000300.SH"]}``；每个目标日
+        仅以当日历史成分股计算截面相关性。传入时不得同时传 instruments。
     method : {"pearson", "spearman"}
         单日截面相关系数方法。
     min_obs : int
@@ -666,7 +724,7 @@ def calculate_factor_correlation(
     ----
     dict
         包含 correlation_matrix、overlap_days、factor_data、
-        target_dates、figure 和 axis。
+        target_dates、universe_config、universe_panel、figure 和 axis。
     """
     started_at = time.perf_counter()
     start_date = _normalize_timestamp(
@@ -699,6 +757,8 @@ def calculate_factor_correlation(
             factor_params_by_name,
         )
     )
+    if universe is not None and instruments is not None:
+        raise ValueError("universe 与 instruments 互斥；请只指定一种股票池。")
     instruments = _normalize_instruments(instruments)
 
     if method not in {"pearson", "spearman"}:
@@ -714,22 +774,38 @@ def calculate_factor_correlation(
         if show_progress:
             _render_progress(
                 1,
-                7,
+                6,
                 "读取交易日历并生成目标截面",
                 started_at,
             )
 
-        trading_calendar = _query_trading_calendar(
-            end_date,
-            show_progress=show_progress,
-            started_at=started_at,
-        )
+        trading_calendar = _query_trading_calendar(end_date)
         target_dates = _build_target_dates(
             trading_calendar,
             start_date,
             end_date,
             frequency,
         )
+        if show_progress:
+            _render_progress(
+                2,
+                6,
+                "读取并校验点时动态股票池" if universe is not None else "确认固定股票池范围",
+                started_at,
+            )
+        if universe is None:
+            universe_config = (
+                {"type": "all_a"}
+                if instruments is None
+                else {"type": "custom", "instruments": instruments}
+            )
+            universe_panel = None
+            load_instruments = instruments
+        else:
+            universe_config, universe_panel, load_instruments = _resolve_universe_panel(
+                universe,
+                target_dates,
+            )
 
         factor_panels = []
         total_factors = len(factor_names)
@@ -737,6 +813,17 @@ def calculate_factor_correlation(
             factor_names,
             start=1,
         ):
+            if show_progress:
+                _render_progress(
+                    3,
+                    6,
+                    (
+                        f"适配器读取并计算因子 "
+                        f"{position}/{total_factors}：{factor_name}"
+                    ),
+                    started_at,
+                )
+
             factor_panels.append(
                 _load_one_factor(
                     factor_name=factor_name,
@@ -745,34 +832,25 @@ def calculate_factor_correlation(
                     factor_params=factor_params_by_name[
                         factor_name
                     ],
-                    instruments=instruments,
+                    instruments=load_instruments,
                     progress_every=progress_every,
-                    show_progress=show_progress,
-                    started_at=started_at,
-                    factor_position=position,
-                    factor_total=total_factors,
                 )
             )
 
         if show_progress:
             _render_progress(
                 4,
-                7,
+                6,
                 "按date + instrument对齐全部因子",
                 started_at,
             )
 
         factor_data = _merge_factor_panels(factor_panels)
-        if show_progress:
-            _render_progress(
-                4,
-                7,
-                "全部因子对齐完成",
-                started_at,
-                completed=len(factor_names),
-                total=len(factor_names),
-                current=f"合并面板{len(factor_data):,}行",
-            )
+        factor_data = _filter_panel_to_universe(
+            factor_data,
+            universe_panel,
+            "factor_data",
+        )
         correlation_matrix, overlap_days = (
             _calculate_correlation_from_panel(
                 factor_data=factor_data,
@@ -782,26 +860,18 @@ def calculate_factor_correlation(
                 show_progress=show_progress,
                 progress_every=progress_every,
                 started_at=started_at,
+                stage_number=5,
+                stage_total=6,
             )
         )
-        if show_progress:
-            _render_progress(
-                6,
-                7,
-                "汇总各截面平均相关系数",
-                started_at,
-                completed=1,
-                total=1,
-                current=f"{len(factor_names)}×{len(factor_names)}矩阵",
-            )
 
         figure = None
         axis = None
         if plot:
             if show_progress:
                 _render_progress(
-                    7,
-                    7,
+                    6,
+                    6,
                     "绘制并展示因子相关系数热力图",
                     started_at,
                 )
@@ -819,8 +889,8 @@ def calculate_factor_correlation(
             )
         elif show_progress:
             _render_progress(
-                7,
-                7,
+                6,
+                6,
                 "计算完成，已按参数跳过绘图",
                 started_at,
             )
@@ -830,6 +900,8 @@ def calculate_factor_correlation(
             "overlap_days": overlap_days,
             "factor_data": factor_data,
             "target_dates": target_dates,
+            "universe_config": universe_config,
+            "universe_panel": universe_panel,
             "figure": figure,
             "axis": axis,
         }
