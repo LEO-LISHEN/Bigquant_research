@@ -94,7 +94,7 @@ def calc_qfa_roe(
 
     原始定义为截至目标日最新可得的单季度平均净资产收益率：
 
-    ``quarterly_average_roe``
+    ``quarterly_roe_avg``
     ``→ MAD去极值 + 总体Z-score``
     ``→ 对log(流通市值)和行业哑变量做截面OLS``
     ``→ OLS残差再次MAD去极值 + 总体Z-score``
@@ -102,7 +102,7 @@ def calc_qfa_roe(
     参数
     ----
     data : pandas.DataFrame
-        必须包含date、instrument、quarterly_average_roe、
+        必须包含date、instrument、quarterly_roe_avg、
         float_market_cap。当neutralize_industry=True时还必须包含industry。
         财务字段必须是目标日已经可得的点时数据。
     target_dates : 日期或日期序列，可选
@@ -160,7 +160,7 @@ def calc_qfa_roe(
     required_columns = {
         "date",
         "instrument",
-        "quarterly_average_roe",
+        "quarterly_roe_avg",
         "float_market_cap",
     }
     if neutralize_industry:
@@ -175,7 +175,7 @@ def calc_qfa_roe(
     selected_columns = [
         "date",
         "instrument",
-        "quarterly_average_roe",
+        "quarterly_roe_avg",
         "float_market_cap",
     ]
     if neutralize_industry:
@@ -200,7 +200,7 @@ def calc_qfa_roe(
             f"{examples}"
         )
 
-    for column in ["quarterly_average_roe", "float_market_cap"]:
+    for column in ["quarterly_roe_avg", "float_market_cap"]:
         df[column] = pd.to_numeric(df[column], errors="coerce").replace(
             [np.inf, -np.inf],
             np.nan,
@@ -236,7 +236,7 @@ def calc_qfa_roe(
         for position, (date, section) in enumerate(grouped_dates, start=1):
             section = section.copy()
             raw_z = _robust_zscore(
-                section["quarterly_average_roe"],
+                section["quarterly_roe_avg"],
                 winsor_k=winsor_k,
             )
 
@@ -348,7 +348,7 @@ FACTOR = {
         "required": {
             'date': {},
             'instrument': {},
-            'quarterly_average_roe': {},
+            'quarterly_roe_avg': {},
             'float_market_cap': {},
         },
         "conditional": {
@@ -384,7 +384,8 @@ FACTOR_INFO = """
 
 使用目标日可得的单季平均 ROE，经市值中性化、可选行业中性化、去极值和标准化后形成质量暴露。数值越高通常代表盈利质量更强。
 
-- **计算**：以点时财务字段 `quarterly_average_roe` 为原始输入。
+- **计算**：以点时财务字段 `quarterly_roe_avg` 为原始输入。
 - **时点**：财务字段必须按真实披露可得时间对齐。
 - **研究提示**：ROE 可能受杠杆和一次性损益影响，宜配合利润与现金流指标判断。
 """
+

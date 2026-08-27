@@ -10,13 +10,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import pickle
 import re
 import threading
 import time
 import uuid
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -166,6 +167,39 @@ DEFAULT_TRAINING_CONFIG = {
     "gan_learning_rate": 0.0002,
     "gru_learning_rate": 0.001,
     "random_seed": 42,
+    # strict：任何序列位置存在 NaN 时不构造样本，保持旧版严格口径。
+    # impute_with_mask：仅用训练期统计量填补 NaN，并将缺失掩码作为额外输入。
+    "missing_feature_mode": "strict",
+    # 放宽模式下，一条样本至少有该比例的原始特征值真实可得；防止用几乎全空的
+    # 序列强行产生分数。严格模式下此参数恒等于 1.0。
+    "minimum_observed_value_ratio": 0.50,
+}
+
+
+# 特征筛选只服务于 GAN-GRU，不能替代正式的样本外回测。默认值刻意保守：
+# 初筛只训练一次低预算模型，只有少量最终候选集合使用正式训练参数复训确认。
+DEFAULT_FEATURE_SELECTION_CONFIG = {
+    "train_ratio": 0.70,
+    "additional_purge_trading_days": 0,
+    "min_coverage": 0.80,
+    "min_rankic_stocks": 30,
+    "min_positive_rankic_ratio": 0.50,
+    "rankic_lcb_z": 1.645,
+    "hac_lags": None,
+    "top_quantile": 0.10,
+    "permutation_repeats": 1,
+    # None 表示不因数量截断置换重要性排序；最终集合规模仅由
+    # final_feature_counts 明确指定。
+    "max_selected_features": None,
+    "final_feature_counts": (4, 6, 8),
+    "screening_gan_epochs": 1,
+    "screening_gru_max_epochs": 3,
+    "screening_early_stop_patience": 1,
+    "max_interaction_pairs": 0,
+    # 先以严格的完整序列口径审计候选池。若全体候选交集低于门槛，按“移除后
+    # 交集覆盖率提升最大”的规则逐个移除，直到达到门槛；不预设保留数量。
+    "candidate_pool_min_coverage": 0.80,
+    "candidate_pool_min_feature_count": 1,
 }
 
 
@@ -384,6 +418,14 @@ def _normalize_training_config(training_config):
     else:
         raise TypeError("training_config 必须是字典或 None。")
 
+    # `_normalize_training_config` 会在返回结果中附加一个供模型包使用的
+    # 派生字段 `missing_data_config`。特征筛选流程会基于该规范化结果再生成
+    # 一份“低预算筛选训练配置”，因此该派生字段可能再次传回本函数。
+    #
+    # 这里显式接受并校验它，使规范化函数具有幂等性；同时仍拒绝真正未知的
+    # 用户参数，避免拼写错误被静默吞掉。
+    supplied_missing_data_config = supplied.pop("missing_data_config", None)
+
     unknown = sorted(set(supplied) - set(DEFAULT_TRAINING_CONFIG))
     if unknown:
         raise ValueError(f"training_config 包含未知参数：{unknown}。")
@@ -450,7 +492,63 @@ def _normalize_training_config(training_config):
     ):
         raise ValueError("random_seed 必须是整数。")
     config["random_seed"] = int(seed)
+    resolved_missing_data_config = _normalize_missing_data_config(
+        {
+            "mode": config["missing_feature_mode"],
+            "minimum_observed_value_ratio": config[
+                "minimum_observed_value_ratio"
+            ],
+        }
+    )
+    if supplied_missing_data_config is not None:
+        supplied_missing_data_config = _normalize_missing_data_config(
+            supplied_missing_data_config
+        )
+        if supplied_missing_data_config != resolved_missing_data_config:
+            raise ValueError(
+                "training_config 中的 missing_data_config 与 "
+                "missing_feature_mode / minimum_observed_value_ratio 不一致。"
+            )
+    config["missing_data_config"] = resolved_missing_data_config
+    config["missing_feature_mode"] = config["missing_data_config"]["mode"]
+    config["minimum_observed_value_ratio"] = config["missing_data_config"][
+        "minimum_observed_value_ratio"
+    ]
     return config
+
+
+def _normalize_missing_data_config(value):
+    """校验并标准化模型的缺失特征处理协议。
+
+    模型包必须持久化该协议；否则固定模型推理时无法判断输入维度，也不能保证
+    训练和推理采取同一填补规则。旧模型包未登记时按 strict 兼容。
+    """
+    if value is None:
+        supplied = {}
+    elif isinstance(value, Mapping):
+        supplied = dict(value)
+    else:
+        raise TypeError("missing_data_config 必须是字典或 None。")
+    allowed = {"mode", "minimum_observed_value_ratio"}
+    unknown = sorted(set(supplied) - allowed)
+    if unknown:
+        raise ValueError(f"missing_data_config 包含未知参数：{unknown}。")
+    mode = str(supplied.get("mode", "strict")).strip().lower()
+    if mode not in {"strict", "impute_with_mask"}:
+        raise ValueError(
+            "missing_feature_mode 只能为 'strict' 或 'impute_with_mask'。"
+        )
+    ratio = float(supplied.get("minimum_observed_value_ratio", 1.0))
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError("minimum_observed_value_ratio 必须位于 (0, 1]。")
+    if mode == "strict":
+        ratio = 1.0
+    return {"mode": mode, "minimum_observed_value_ratio": ratio}
+
+
+def _model_input_size(feature_count, missing_data_config):
+    config = _normalize_missing_data_config(missing_data_config)
+    return feature_count * (2 if config["mode"] == "impute_with_mask" else 1)
 
 
 def _require_torch():
@@ -490,7 +588,7 @@ def _build_gru_model(model_config):
     return StockGRU(), torch
 
 
-def _normalize_model_config(model_config, feature_count):
+def _normalize_model_config(model_config, feature_count, missing_data_config=None):
     if not isinstance(model_config, Mapping):
         raise TypeError("model_config 必须是字典。")
     required = {
@@ -510,9 +608,13 @@ def _normalize_model_config(model_config, feature_count):
         "num_layers": int(model_config["num_layers"]),
         "dropout": float(model_config["dropout"]),
     }
-    if normalized["input_size"] != feature_count:
+    expected_input_size = _model_input_size(
+        feature_count,
+        missing_data_config,
+    )
+    if normalized["input_size"] != expected_input_size:
         raise ValueError(
-            "model_config.input_size 与 feature_spec 特征数量不一致。"
+            "model_config.input_size 与 feature_spec 和缺失值处理模式不一致。"
         )
     if min(
         normalized["input_size"],
@@ -544,9 +646,13 @@ def _validate_model_bundle(model_bundle):
     expected_hash = _json_hash(feature_spec)
     if model_bundle["feature_schema_hash"] != expected_hash:
         raise ValueError("模型包的 feature_schema_hash 校验失败。")
+    missing_data_config = _normalize_missing_data_config(
+        model_bundle.get("missing_data_config")
+    )
     model_config = _normalize_model_config(
         model_bundle["model_config"],
         len(feature_spec),
+        missing_data_config,
     )
 
     scaler = model_bundle["scaler"]
@@ -574,6 +680,7 @@ def _validate_model_bundle(model_bundle):
         "model_state_dict": dict(state_dict),
         "scaler": {"mean": mean, "std": std},
         "model_config": model_config,
+        "missing_data_config": missing_data_config,
         "feature_spec": feature_spec,
         "feature_schema_hash": expected_hash,
         "training_metadata": copy.deepcopy(
@@ -772,7 +879,9 @@ def _calculate_feature_panel(
             panel = panel.merge(
                 piece,
                 on=["date", "instrument"],
-                how="inner",
+                # 不能在合并阶段丢弃任一因子缺失的股票；strict/放宽模式分别在
+                # 序列构造阶段决定是否接受该样本。
+                how="outer",
                 validate="one_to_one",
             )
         panel["date"] = pd.to_datetime(panel["date"]).dt.normalize()
@@ -788,7 +897,9 @@ def _build_prediction_sequences(
     feature_panel,
     feature_names,
     sequence_dates,
+    missing_data_config=None,
 ):
+    missing_config = _normalize_missing_data_config(missing_data_config)
     section = feature_panel.loc[
         feature_panel["date"].isin(sequence_dates)
     ]
@@ -808,7 +919,13 @@ def _build_prediction_sequences(
         )
         if values.shape != (len(sequence_dates), len(feature_names)):
             continue
-        if not np.isfinite(values).all():
+        observed_ratio = float(np.isfinite(values).mean())
+        if (
+            missing_config["mode"] == "strict"
+            and not np.isfinite(values).all()
+        ):
+            continue
+        if observed_ratio < missing_config["minimum_observed_value_ratio"]:
             continue
         instruments.append(str(instrument))
         sequences.append(values)
@@ -820,24 +937,44 @@ def _build_prediction_sequences(
     return instruments, np.stack(sequences).astype(np.float32, copy=False)
 
 
+def _transform_sequences_for_model(sequences, bundle):
+    """用模型包中训练期统计量完成推理前变换，绝不使用推理期数据拟合。"""
+    feature_count = len(bundle["feature_spec"])
+    expected_raw_shape = (
+        bundle["model_config"]["sequence_length"],
+        feature_count,
+    )
+    if sequences.ndim != 3 or tuple(sequences.shape[1:]) != expected_raw_shape:
+        raise ValueError(
+            f"原始推理序列形状应为 (样本数, {expected_raw_shape[0]}, "
+            f"{expected_raw_shape[1]})，实际为 {sequences.shape}。"
+        )
+    values = np.asarray(sequences, dtype=np.float32)
+    observed = np.isfinite(values)
+    mode = bundle["missing_data_config"]["mode"]
+    if mode == "strict" and not observed.all():
+        raise ValueError("strict 模式不接受包含缺失特征值的推理序列。")
+    observed_ratio = observed.mean(axis=(1, 2))
+    threshold = bundle["missing_data_config"]["minimum_observed_value_ratio"]
+    if (observed_ratio < threshold).any():
+        raise ValueError("推理序列的真实特征值占比低于模型登记的最低要求。")
+    mean = bundle["scaler"]["mean"].reshape(1, 1, -1)
+    std = bundle["scaler"]["std"].reshape(1, 1, -1)
+    filled = np.where(observed, values, mean)
+    standardized = ((filled - mean) / std).astype(np.float32, copy=False)
+    if mode == "strict":
+        return standardized
+    # 掩码 1 表示该位置由训练期均值填补，模型可学习“缺失本身”的信息。
+    missing_mask = (~observed).astype(np.float32, copy=False)
+    return np.concatenate([standardized, missing_mask], axis=2)
+
+
 def _predict_with_bundle(model_bundle, sequences):
     bundle = _validate_model_bundle(model_bundle)
-    expected_shape = (
-        bundle["model_config"]["sequence_length"],
-        bundle["model_config"]["input_size"],
-    )
-    if sequences.ndim != 3 or tuple(sequences.shape[1:]) != expected_shape:
-        raise ValueError(
-            f"推理序列形状应为 (样本数, {expected_shape[0]}, "
-            f"{expected_shape[1]})，实际为 {sequences.shape}。"
-        )
-
     model, torch = _build_gru_model(bundle["model_config"])
     model.load_state_dict(bundle["model_state_dict"], strict=True)
     model.eval()
-    standardized = (
-        sequences - bundle["scaler"]["mean"].reshape(1, 1, -1)
-    ) / bundle["scaler"]["std"].reshape(1, 1, -1)
+    standardized = _transform_sequences_for_model(sequences, bundle)
     with torch.no_grad():
         scores = model(
             torch.tensor(standardized, dtype=torch.float32)
@@ -885,6 +1022,11 @@ def calc_gan_gru_score(
     )
     feature_names = [item["feature_name"] for item in normalized_features]
     feature_hash = _json_hash(normalized_features)
+    runtime_missing_config = (
+        _validate_model_bundle(fixed_model_bundle)["missing_data_config"]
+        if fixed_model_bundle is not None
+        else _normalize_training_config(training_config)["missing_data_config"]
+    )
     feature_panel = _calculate_feature_panel(
         data_bundle,
         normalized_features,
@@ -913,6 +1055,7 @@ def calc_gan_gru_score(
             feature_panel,
             feature_names,
             sequence_dates,
+            runtime_missing_config,
         )
         if not instruments:
             continue
@@ -1011,10 +1154,6 @@ def _load_training_features(
                 item["factor_name"],
                 item["params"],
             )
-            if requirements["dependencies"] is not None:
-                raise NotImplementedError(
-                    "GAN-GRU 当前训练特征只能使用无下级依赖的基础因子。"
-                )
             lookback = requirements["data_window"][
                 "lookback_trading_days"
             ]
@@ -1116,7 +1255,8 @@ def _load_training_features(
             panel = panel.merge(
                 piece,
                 on=["date", "instrument"],
-                how="inner",
+                # 保留单个因子的 NaN，交由样本构造阶段按模型缺失模式处理。
+                how="outer",
                 validate="one_to_one",
             )
         panel["date"] = pd.to_datetime(panel["date"]).dt.normalize()
@@ -1216,7 +1356,9 @@ def _build_training_samples(
     sequence_length,
     show_progress=False,
     progress_every=20,
+    missing_data_config=None,
 ):
+    missing_config = _normalize_missing_data_config(missing_data_config)
     feature_positions = {
         date: index for index, date in enumerate(feature_dates)
     }
@@ -1255,7 +1397,13 @@ def _build_training_samples(
                 if start < 0:
                     continue
                 sequence = matrix[start:end]
-                if not np.isfinite(sequence).all():
+                observed_ratio = float(np.isfinite(sequence).mean())
+                if (
+                    missing_config["mode"] == "strict"
+                    and not np.isfinite(sequence).all()
+                ):
+                    continue
+                if observed_ratio < missing_config["minimum_observed_value_ratio"]:
                     continue
                 target = float(label_lookup.loc[label_key])
                 if not np.isfinite(target) or sample_date not in sample_set:
@@ -1366,6 +1514,7 @@ def train_gan_gru_model(
     training_config=None,
     training_start_date=None,
     training_end_date=None,
+    universe_panel=None,
     show_progress=False,
     progress_every=20,
 ):
@@ -1405,10 +1554,6 @@ def train_gan_gru_model(
         requirements = get_factor_data_requirements(
             item["factor_name"], item["params"]
         )
-        if requirements["dependencies"] is not None:
-            raise NotImplementedError(
-                "GAN-GRU 当前训练特征只能使用无下级依赖的基础因子。"
-            )
         maximum_child_lookback = max(
             maximum_child_lookback,
             requirements["data_window"]["lookback_trading_days"],
@@ -1516,6 +1661,34 @@ def train_gan_gru_model(
         horizon,
         show_progress=show_progress,
     )
+    if universe_panel is not None:
+        if not isinstance(universe_panel, pd.DataFrame):
+            raise TypeError("universe_panel 必须是 pandas.DataFrame 或 None。")
+        required_universe_columns = {"date", "instrument"}
+        missing_universe_columns = required_universe_columns - set(
+            universe_panel.columns
+        )
+        if missing_universe_columns:
+            raise ValueError(
+                "universe_panel 缺少字段："
+                f"{sorted(missing_universe_columns)}。"
+            )
+        eligible_universe = universe_panel.loc[:, ["date", "instrument"]].copy()
+        eligible_universe["date"] = pd.to_datetime(
+            eligible_universe["date"], errors="coerce"
+        ).dt.normalize()
+        if eligible_universe.isna().any().any():
+            raise ValueError("universe_panel 包含无效 date 或 instrument。")
+        if eligible_universe.duplicated(["date", "instrument"]).any():
+            raise ValueError("universe_panel 存在重复 date + instrument。")
+        labels = labels.merge(
+            eligible_universe,
+            on=["date", "instrument"],
+            how="inner",
+            validate="one_to_one",
+        )
+        if labels.empty:
+            raise ValueError("按动态股票池过滤后训练标签为空。")
     feature_names = [item["feature_name"] for item in normalized_features]
     x_all, y_all, sample_date_values = _build_training_samples(
         feature_panel,
@@ -1526,6 +1699,7 @@ def train_gan_gru_model(
         config["sequence_length"],
         show_progress=show_progress,
         progress_every=progress_every,
+        missing_data_config=config["missing_data_config"],
     )
     if len(x_all) < config["minimum_training_samples"]:
         raise ValueError(
@@ -1571,18 +1745,45 @@ def train_gan_gru_model(
             ),
         )
 
-    mean = x_train.reshape(-1, len(feature_names)).mean(axis=0)
-    std = x_train.reshape(-1, len(feature_names)).std(axis=0, ddof=0)
+    # 仅用训练子集拟合填补值与标准化参数，验证/推理期绝不参与。
+    mean = np.nanmean(x_train.reshape(-1, len(feature_names)), axis=0)
+    std = np.nanstd(x_train.reshape(-1, len(feature_names)), axis=0, ddof=0)
+    if not np.isfinite(mean).all():
+        missing_features = [
+            feature_names[index]
+            for index, value in enumerate(mean)
+            if not np.isfinite(value)
+        ]
+        raise ValueError(
+            "训练期存在完全没有有效值的特征，不能进行缺失值放宽训练："
+            f"{missing_features}。"
+        )
     std = np.where(std > 1e-8, std, 1.0).astype(np.float32)
     mean = mean.astype(np.float32)
-    x_train = ((x_train - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)).astype(np.float32)
-    x_validation = ((x_validation - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)).astype(np.float32)
+
+    def prepare_inputs(raw_sequences):
+        observed = np.isfinite(raw_sequences)
+        filled = np.where(observed, raw_sequences, mean.reshape(1, 1, -1))
+        standardized = (
+            (filled - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
+        ).astype(np.float32)
+        if config["missing_data_config"]["mode"] == "strict":
+            return standardized
+        return np.concatenate(
+            [standardized, (~observed).astype(np.float32)], axis=2
+        )
+
+    x_train = prepare_inputs(x_train)
+    x_validation = prepare_inputs(x_validation)
+    model_input_size = _model_input_size(
+        len(feature_names), config["missing_data_config"]
+    )
     if show_progress:
         _print_training_progress(
             "完成训练集标准化",
             training_started_at,
             detail=(
-                f"特征维度 {len(feature_names)}，"
+                f"原始特征维度 {len(feature_names)}，模型输入维度 {model_input_size}，"
                 f"序列长度 {config['sequence_length']}"
             ),
         )
@@ -1637,10 +1838,10 @@ def train_gan_gru_model(
         batch_size=config["batch_size"],
         shuffle=True,
     )
-    generator = Generator(len(feature_names), config["latent_dim"]).to(device)
+    generator = Generator(model_input_size, config["latent_dim"]).to(device)
     discriminator = Discriminator(
         config["sequence_length"],
-        len(feature_names),
+        model_input_size,
         config["discriminator_hidden_size"],
     ).to(device)
     generator_optimizer = optim.Adam(
@@ -1807,7 +2008,7 @@ def train_gan_gru_model(
             )
 
         model_config = {
-            "input_size": len(feature_names),
+            "input_size": model_input_size,
             "sequence_length": config["sequence_length"],
             "hidden_size": config["hidden_size"],
             "num_layers": config["num_layers"],
@@ -2015,6 +2216,7 @@ def train_gan_gru_model(
             "model_state_dict": best_state,
             "scaler": {"mean": mean, "std": std},
             "model_config": model_config,
+            "missing_data_config": config["missing_data_config"],
             "feature_spec": normalized_features,
             "feature_schema_hash": _json_hash(normalized_features),
             "training_metadata": {
@@ -2030,6 +2232,7 @@ def train_gan_gru_model(
                 "best_epoch": best_epoch,
                 "best_validation_rank_ic": best_rank_ic,
                 "training_config": config,
+                "missing_data_config": config["missing_data_config"],
                 "training_config_hash": _json_hash(config),
             },
         }
@@ -2043,6 +2246,1461 @@ def train_gan_gru_model(
                 ),
             )
         return _validate_model_bundle(bundle)
+    finally:
+        if show_progress:
+            print()
+
+
+def _selection_progress(stage, started_at, completed=None, total=None, detail=""):
+    """GAN-GRU 特征筛选的统一单行进度输出。"""
+    elapsed = time.perf_counter() - started_at
+    parts = [f"[GAN-GRU特征筛选] {stage}"]
+    if completed is not None and total is not None and total > 0:
+        ratio = min(max(float(completed) / float(total), 0.0), 1.0)
+        parts.append(f"{completed}/{total} ({ratio:.1%})")
+        if 0 < completed < total:
+            parts.append(f"预计剩余 {elapsed * (1.0 - ratio) / ratio:.1f}s")
+    if detail:
+        parts.append(str(detail))
+    parts.append(f"已耗时 {elapsed:.1f}s")
+    print("\r" + " | ".join(parts).ljust(220), end="", flush=True)
+
+
+def _selection_positive_integer(value, parameter_name, allow_zero=False):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{parameter_name} 必须为{'非负' if allow_zero else '正'}整数。")
+    value = int(value)
+    if value < 0 or (value == 0 and not allow_zero):
+        raise ValueError(f"{parameter_name} 必须为{'非负' if allow_zero else '正'}整数。")
+    return value
+
+
+def _normalize_feature_selection_config(selection_config):
+    if selection_config is None:
+        supplied = {}
+    elif isinstance(selection_config, Mapping):
+        supplied = dict(selection_config)
+    else:
+        raise TypeError("selection_config 必须是字典或 None。")
+    unknown = sorted(set(supplied) - set(DEFAULT_FEATURE_SELECTION_CONFIG))
+    if unknown:
+        raise ValueError(f"selection_config 包含未知参数：{unknown}。")
+    config = dict(DEFAULT_FEATURE_SELECTION_CONFIG)
+    config.update(supplied)
+
+    ratio = float(config["train_ratio"])
+    if not 0.5 <= ratio < 1.0:
+        raise ValueError("selection_config['train_ratio'] 必须位于 [0.5, 1) 内。")
+    config["train_ratio"] = ratio
+    config["additional_purge_trading_days"] = _selection_positive_integer(
+        config["additional_purge_trading_days"],
+        "selection_config['additional_purge_trading_days']",
+        allow_zero=True,
+    )
+    config["min_rankic_stocks"] = _selection_positive_integer(
+        config["min_rankic_stocks"],
+        "selection_config['min_rankic_stocks']",
+    )
+    for name in (
+        "permutation_repeats",
+        "screening_gan_epochs",
+        "screening_gru_max_epochs",
+        "screening_early_stop_patience",
+    ):
+        config[name] = _selection_positive_integer(
+            config[name], f"selection_config[{name!r}]"
+        )
+    if config["max_selected_features"] is not None:
+        config["max_selected_features"] = _selection_positive_integer(
+            config["max_selected_features"],
+            "selection_config['max_selected_features']",
+        )
+    config["max_interaction_pairs"] = _selection_positive_integer(
+        config["max_interaction_pairs"],
+        "selection_config['max_interaction_pairs']",
+        allow_zero=True,
+    )
+    for name in (
+        "min_coverage",
+        "candidate_pool_min_coverage",
+        "min_positive_rankic_ratio",
+        "top_quantile",
+    ):
+        value = float(config[name])
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"selection_config[{name!r}] 必须位于 (0, 1]。")
+        config[name] = value
+    config["candidate_pool_min_feature_count"] = _selection_positive_integer(
+        config["candidate_pool_min_feature_count"],
+        "selection_config['candidate_pool_min_feature_count']",
+    )
+    z_value = float(config["rankic_lcb_z"])
+    if not np.isfinite(z_value) or z_value <= 0:
+        raise ValueError("selection_config['rankic_lcb_z'] 必须为正数。")
+    config["rankic_lcb_z"] = z_value
+    if config["hac_lags"] is not None:
+        config["hac_lags"] = _selection_positive_integer(
+            config["hac_lags"],
+            "selection_config['hac_lags']",
+            allow_zero=True,
+        )
+
+    counts = config["final_feature_counts"]
+    if not isinstance(counts, Sequence) or isinstance(counts, (str, bytes)):
+        raise TypeError("selection_config['final_feature_counts'] 必须是整数序列。")
+    config["final_feature_counts"] = tuple(
+        sorted(
+            {
+                _selection_positive_integer(
+                    value, "selection_config['final_feature_counts']"
+                )
+                for value in counts
+            }
+        )
+    )
+    if not config["final_feature_counts"]:
+        raise ValueError("selection_config['final_feature_counts'] 不能为空。")
+    return config
+
+
+def _normalize_selection_candidate_params(params, factor_name):
+    if params is None:
+        return {}
+    if not isinstance(params, Mapping):
+        raise TypeError(f"候选因子 {factor_name!r} 的参数必须是字典。")
+    result = dict(params)
+    reserved = sorted(set(result) & _RESERVED_CHILD_PARAMS)
+    if reserved:
+        raise ValueError(
+            f"候选因子 {factor_name!r} 不得覆盖系统参数：{reserved}。"
+        )
+    return result
+
+
+def _candidate_instances_from_metadata(factor_name, metadata):
+    """将 FACTOR 中登记的常用实例展开为稳定的候选定义。"""
+    raw_instances = metadata.get("candidate_instances")
+    if raw_instances is None:
+        return [("default", {})]
+    if isinstance(raw_instances, Mapping):
+        source = [
+            {"id": instance_id, "params": params}
+            for instance_id, params in raw_instances.items()
+        ]
+    elif isinstance(raw_instances, Sequence) and not isinstance(
+        raw_instances, (str, bytes)
+    ):
+        source = list(raw_instances)
+    else:
+        raise TypeError(
+            f"因子 {factor_name!r} 的 candidate_instances 必须是列表或字典。"
+        )
+    result = []
+    seen = set()
+    for position, item in enumerate(source, start=1):
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                f"因子 {factor_name!r} 的 candidate_instances 第 {position} 项必须是字典。"
+            )
+        instance_id = str(item.get("id", "")).strip()
+        if not instance_id:
+            raise ValueError(
+                f"因子 {factor_name!r} 的 candidate_instances 第 {position} 项缺少 id。"
+            )
+        if instance_id in seen:
+            raise ValueError(
+                f"因子 {factor_name!r} 的 candidate_instances id 重复：{instance_id!r}。"
+            )
+        seen.add(instance_id)
+        result.append(
+            (
+                instance_id,
+                _normalize_selection_candidate_params(
+                    item.get("params", {}), factor_name
+                ),
+            )
+        )
+    if not result:
+        raise ValueError(f"因子 {factor_name!r} 的 candidate_instances 不能为空。")
+    return result
+
+
+def _normalize_candidate_source(candidate_source):
+    if candidate_source is None:
+        return ()
+    if isinstance(candidate_source, str):
+        candidate_source = [candidate_source]
+    if not isinstance(candidate_source, Sequence):
+        raise TypeError("candidate_source 必须是字符串、字符串序列或 None。")
+    aliases = {
+        "base": "base",
+        "base_factors": "base",
+        "composite": "composite",
+        "composite_factors": "composite",
+    }
+    result = []
+    for item in candidate_source:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("candidate_source 含有无效类别名称。")
+        key = item.strip().lower()
+        if key not in aliases:
+            raise ValueError(
+                "candidate_source 仅支持 'base_factors'、'composite_factors'，"
+                "或对应的 base、composite 别名。"
+            )
+        if aliases[key] not in result:
+            result.append(aliases[key])
+    return tuple(result)
+
+
+def _candidate_feature_name(factor_name, instance_id):
+    value = re.sub(r"[^0-9A-Za-z_]+", "_", f"{factor_name}_{instance_id}")
+    value = value.strip("_").lower()
+    if not value:
+        raise ValueError(f"无法为 {factor_name!r} 生成合法 feature_name。")
+    return value
+
+
+def _expand_feature_selection_candidates(candidate_spec, candidate_source):
+    """支持手工候选字典与按 FACTOR['factor_type'] 的整类发现。"""
+    from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+        get_factor_metadata,
+    )
+    from factor_lib.factor_hub.discover_factors import discover_factors
+
+    if candidate_spec is not None and not isinstance(candidate_spec, Mapping):
+        raise TypeError("candidate_spec 必须是字典或 None。")
+    source_types = _normalize_candidate_source(candidate_source)
+    if candidate_spec is None and not source_types:
+        raise ValueError("必须传入 candidate_spec 或 candidate_source。")
+
+    raw = []
+    if candidate_spec is not None:
+        for factor_name, requested_instances in candidate_spec.items():
+            if not isinstance(factor_name, str) or not factor_name.strip():
+                raise ValueError("candidate_spec 存在无效因子名称。")
+            name = factor_name.strip()
+            metadata = get_factor_metadata(name)
+            if metadata.get("factor_type") == "machine_learning" or name == "gan_gru_score":
+                raise ValueError("特征筛选候选池不能包含机器学习因子或 gan_gru_score 自身。")
+            if requested_instances is None:
+                instances = _candidate_instances_from_metadata(name, metadata)
+            elif isinstance(requested_instances, Mapping):
+                instances = [("custom", _normalize_selection_candidate_params(requested_instances, name))]
+            elif isinstance(requested_instances, Sequence) and not isinstance(
+                requested_instances, (str, bytes)
+            ):
+                instances = []
+                for index, value in enumerate(requested_instances, start=1):
+                    if not isinstance(value, Mapping):
+                        raise TypeError(
+                            f"candidate_spec[{name!r}] 第 {index} 项必须是参数字典。"
+                        )
+                    raw_id = str(value.get("id", "")).strip()
+                    params = value.get("params", value)
+                    if raw_id:
+                        if not isinstance(params, Mapping):
+                            raise TypeError(f"候选因子 {name!r} 的 params 必须是字典。")
+                        params = dict(params)
+                        params.pop("id", None)
+                        params.pop("params", None)
+                    else:
+                        params = dict(value)
+                    params = _normalize_selection_candidate_params(params, name)
+                    instance_id = raw_id or _json_hash(params)[:10]
+                    instances.append((instance_id, params))
+            else:
+                raise TypeError(
+                    f"candidate_spec[{name!r}] 必须是 None、参数字典或参数字典列表。"
+                )
+            raw.extend((name, instance_id, params) for instance_id, params in instances)
+
+    if source_types:
+        discovered = discover_factors()
+        for name, metadata in sorted(discovered.items()):
+            factor_type = metadata.get("factor_type")
+            if factor_type not in source_types:
+                continue
+            if factor_type == "machine_learning" or name == "gan_gru_score":
+                continue
+            raw.extend(
+                (name, instance_id, params)
+                for instance_id, params in _candidate_instances_from_metadata(
+                    name, metadata
+                )
+            )
+
+    candidates = []
+    seen_ids = set()
+    seen_feature_names = set()
+    for factor_name, instance_id, params in raw:
+        candidate_id = f"{factor_name}::{instance_id}"
+        if candidate_id in seen_ids:
+            continue
+        feature_name = _candidate_feature_name(factor_name, instance_id)
+        if feature_name in seen_feature_names:
+            raise ValueError(f"候选特征列名重复：{feature_name!r}。")
+        seen_ids.add(candidate_id)
+        seen_feature_names.add(feature_name)
+        candidates.append(
+            {
+                "candidate_id": candidate_id,
+                "factor_name": factor_name,
+                "instance_id": str(instance_id),
+                "params": dict(params),
+                "feature_name": feature_name,
+            }
+        )
+    if not candidates:
+        raise ValueError("展开后没有可用于 GAN-GRU 的候选特征实例。")
+    return candidates
+
+
+def _normalize_selection_instruments(instruments):
+    if isinstance(instruments, str):
+        instruments = [instruments]
+    if not isinstance(instruments, Sequence):
+        raise TypeError("股票列表必须是非空代码序列。")
+    result = []
+    for value in instruments:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"无效股票代码：{value!r}")
+        code = value.strip()
+        if code not in result:
+            result.append(code)
+    if not result:
+        raise ValueError("股票列表不能为空。")
+    return result
+
+
+def _selection_quote_sql_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _selection_index_universe(index_codes, target_dates):
+    try:
+        import dai
+    except ImportError as exc:
+        raise ImportError("未能导入 dai；请在 BigQuant 环境运行。") from exc
+    date_sql = ", ".join(
+        _selection_quote_sql_literal(date.strftime("%Y-%m-%d"))
+        for date in target_dates
+    )
+    index_sql = ", ".join(_selection_quote_sql_literal(code) for code in index_codes)
+    sql = f"""
+    SELECT date, member_code AS instrument
+    FROM cn_stock_index_component
+    WHERE instrument IN ({index_sql})
+      AND date IN ({date_sql})
+    ORDER BY date, member_code
+    """
+    panel = dai.query(
+        sql,
+        filters={
+            "date": [
+                target_dates.min().strftime("%Y-%m-%d"),
+                target_dates.max().strftime("%Y-%m-%d"),
+            ]
+        },
+    ).df()
+    required = {"date", "instrument"}
+    if required - set(panel.columns):
+        raise ValueError("指数成分股查询结果缺少 date 或 instrument。")
+    panel = panel.loc[:, ["date", "instrument"]].copy()
+    panel["date"] = pd.to_datetime(panel["date"], errors="coerce").dt.normalize()
+    panel["instrument"] = panel["instrument"].astype("string").str.strip()
+    if panel.empty or panel.isna().any().any() or (panel["instrument"] == "").any():
+        raise ValueError("未读取到完整有效的指数历史成分股。")
+    panel = panel.drop_duplicates(["date", "instrument"])
+    missing_dates = target_dates.difference(pd.DatetimeIndex(panel["date"].unique()))
+    if not missing_dates.empty:
+        raise ValueError("部分筛选日期未找到指数历史成分股。")
+    return panel.sort_values(["date", "instrument"], kind="mergesort").reset_index(drop=True)
+
+
+def _resolve_selection_universe(universe, target_dates, show_progress, started_at):
+    """将三种用户股票池模式解析为点时 date + instrument 面板。"""
+    from factor_lib.common.data_adapters.bigquant_adapters.daily import (
+        load_daily_raw_data,
+    )
+
+    if universe is None or universe == "all_a":
+        raise ValueError(
+            "GAN-GRU 特征筛选必须显式指定市场市值组、动态指数或自定义股票列表；"
+            "不支持无边界的 all_a 股票池。"
+        )
+    if isinstance(universe, Sequence) and not isinstance(universe, (str, bytes, Mapping)):
+        instruments = _normalize_selection_instruments(universe)
+        panel = pd.MultiIndex.from_product(
+            [target_dates, instruments], names=["date", "instrument"]
+        ).to_frame(index=False)
+        return {"type": "custom", "instruments": instruments}, panel, instruments
+    if not isinstance(universe, Mapping):
+        raise TypeError("universe 必须是股票列表或股票池配置字典。")
+    universe_type = str(universe.get("type", "")).strip().lower()
+    if universe_type in {"custom", "custom_list"}:
+        instruments = _normalize_selection_instruments(universe.get("instruments"))
+        panel = pd.MultiIndex.from_product(
+            [target_dates, instruments], names=["date", "instrument"]
+        ).to_frame(index=False)
+        return {"type": "custom", "instruments": instruments}, panel, instruments
+    if universe_type == "index":
+        index_codes = _normalize_selection_instruments(
+            universe.get("index_codes", universe.get("code"))
+        )
+        if show_progress:
+            _selection_progress("读取点时指数成分股", started_at, detail=f"{index_codes}")
+        panel = _selection_index_universe(index_codes, target_dates)
+        return (
+            {"type": "index", "index_codes": index_codes},
+            panel,
+            sorted(panel["instrument"].unique().tolist()),
+        )
+    if universe_type in {"market_cap_groups", "market_cap"}:
+        group_count = _selection_positive_integer(
+            universe.get("group_count", 15), "universe['group_count']"
+        )
+        selected_groups = universe.get("selected_groups")
+        if not isinstance(selected_groups, Sequence) or isinstance(selected_groups, (str, bytes)):
+            raise TypeError("universe['selected_groups'] 必须是市值组编号序列。")
+        selected_groups = sorted(
+            {
+                _selection_positive_integer(value, "universe['selected_groups']")
+                for value in selected_groups
+            }
+        )
+        if not selected_groups or selected_groups[-1] > group_count:
+            raise ValueError("selected_groups 必须位于 1 到 group_count 之间。")
+        if show_progress:
+            _selection_progress(
+                "读取点时市值并划分股票池",
+                started_at,
+                detail=f"{group_count} 组，选择 {selected_groups}",
+            )
+        cap_panel = load_daily_raw_data(
+            standard_fields=["total_market_cap"],
+            dates=target_dates,
+            instruments=None,
+            show_progress=False,
+        )
+        required = {"date", "instrument", "total_market_cap"}
+        if required - set(cap_panel.columns):
+            raise ValueError("市值股票池数据缺少 date、instrument 或 total_market_cap。")
+        cap_panel = cap_panel.loc[:, ["date", "instrument", "total_market_cap"]].copy()
+        cap_panel["date"] = pd.to_datetime(cap_panel["date"], errors="coerce").dt.normalize()
+        cap_panel["total_market_cap"] = pd.to_numeric(
+            cap_panel["total_market_cap"], errors="coerce"
+        )
+        cap_panel = cap_panel.loc[
+            cap_panel["date"].notna()
+            & cap_panel["instrument"].notna()
+            & cap_panel["total_market_cap"].gt(0)
+        ].copy()
+        if cap_panel.empty:
+            raise ValueError("市值股票池没有有效市值记录。")
+        parts = []
+        for date, group in cap_panel.groupby("date", sort=True):
+            ordered = group.sort_values("total_market_cap", kind="mergesort").copy()
+            ordered["market_cap_group"] = np.ceil(
+                np.arange(1, len(ordered) + 1) * group_count / len(ordered)
+            ).astype(int)
+            parts.append(
+                ordered.loc[
+                    ordered["market_cap_group"].isin(selected_groups),
+                    ["date", "instrument"],
+                ]
+            )
+        panel = pd.concat(parts, ignore_index=True).drop_duplicates(
+            ["date", "instrument"]
+        )
+        missing_dates = target_dates.difference(pd.DatetimeIndex(panel["date"].unique()))
+        if not missing_dates.empty:
+            raise ValueError("部分筛选日期的指定市值组为空。")
+        return (
+            {
+                "type": "market_cap_groups",
+                "group_count": group_count,
+                "selected_groups": selected_groups,
+            },
+            panel.sort_values(["date", "instrument"], kind="mergesort").reset_index(drop=True),
+            sorted(panel["instrument"].unique().tolist()),
+        )
+    raise ValueError("universe['type'] 仅支持 market_cap_groups、index、custom。")
+
+
+def _filter_to_selection_universe(panel, universe_panel, panel_name):
+    if universe_panel is None:
+        return panel.copy()
+    required = {"date", "instrument"}
+    if not isinstance(panel, pd.DataFrame) or required - set(panel.columns):
+        raise ValueError(f"{panel_name} 缺少 date 或 instrument。")
+    result = panel.copy()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce").dt.normalize()
+    if result[["date", "instrument"]].isna().any().any():
+        raise ValueError(f"{panel_name} 包含无效 date 或 instrument。")
+    if result.duplicated(["date", "instrument"]).any():
+        raise ValueError(f"{panel_name} 存在重复 date + instrument。")
+    return result.merge(
+        universe_panel.loc[:, ["date", "instrument"]],
+        on=["date", "instrument"],
+        how="inner",
+        validate="one_to_one",
+    )
+
+
+def _load_selection_calendar(start_date, end_date, history_days, label_horizon_days):
+    from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+        load_trading_dates,
+    )
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if start > end:
+        raise ValueError("selection_start_date 不能晚于 selection_end_date。")
+    span = max(365, int((history_days + label_horizon_days + 20) * 2))
+    for _ in range(7):
+        calendar = load_trading_dates(
+            start - pd.Timedelta(days=span), end + pd.Timedelta(days=span)
+        )
+        calendar = pd.DatetimeIndex(calendar).normalize().unique().sort_values()
+        selected = calendar[(calendar >= start) & (calendar <= end)]
+        if not selected.empty:
+            positions = {date: index for index, date in enumerate(calendar)}
+            first = positions[selected.min()]
+            last = positions[selected.max()]
+            if first >= history_days and last + label_horizon_days < len(calendar):
+                return calendar, selected
+        span *= 2
+    raise ValueError("筛选区间前预热或区间后未来收益标签交易日不足。")
+
+
+def _build_validation_samples(
+    feature_panel,
+    labels,
+    feature_names,
+    validation_dates,
+    calendar,
+    sequence_length,
+    missing_data_config,
+    show_progress,
+    started_at,
+):
+    """按验证截面准备模型输入，保留 date/instrument 用于截面评价。"""
+    positions = {date: index for index, date in enumerate(calendar)}
+    label_lookup = labels.set_index(["date", "instrument"])["target"]
+    samples = []
+    targets = []
+    dates = []
+    instruments = []
+    try:
+        for position, target_date in enumerate(validation_dates, start=1):
+            end_position = positions[target_date]
+            sequence_dates = calendar[
+                end_position - sequence_length + 1 : end_position + 1
+            ]
+            codes, sequences = _build_prediction_sequences(
+                feature_panel,
+                feature_names,
+                sequence_dates,
+                missing_data_config,
+            )
+            if codes:
+                section = pd.DataFrame(
+                    {
+                        "date": target_date,
+                        "instrument": codes,
+                        "sequence_position": np.arange(len(codes)),
+                    }
+                )
+                section["target"] = [
+                    label_lookup.get((target_date, code), np.nan) for code in codes
+                ]
+                section = section.loc[np.isfinite(section["target"])].copy()
+                if not section.empty:
+                    order = section["sequence_position"].to_numpy(dtype=int)
+                    samples.append(sequences[order])
+                    targets.append(section["target"].to_numpy(dtype=np.float32))
+                    dates.extend([target_date] * len(section))
+                    instruments.extend(section["instrument"].astype(str).tolist())
+            if show_progress:
+                _selection_progress(
+                    "准备验证期时序样本",
+                    started_at,
+                    position,
+                    len(validation_dates),
+                    detail=f"当前 {target_date:%Y-%m-%d}，累计 {len(instruments):,} 条",
+                )
+        if not samples:
+            raise ValueError("验证期没有可用于 GAN-GRU 推理的完整时序样本。")
+        return (
+            np.concatenate(samples, axis=0).astype(np.float32, copy=False),
+            np.concatenate(targets).astype(np.float32, copy=False),
+            pd.DatetimeIndex(dates),
+            np.asarray(instruments, dtype=object),
+        )
+    finally:
+        if show_progress:
+            print()
+
+
+def _prune_candidate_pool_by_coverage(
+    feature_spec,
+    calendar,
+    schedule_dates,
+    universe_panel,
+    instruments,
+    sequence_length,
+    minimum_coverage,
+    minimum_feature_count,
+    show_progress,
+    started_at,
+):
+    """按完整序列交集覆盖率逐步压缩候选池。
+
+    这是特征筛选前的质量门槛，不涉及模型训练。每一步仅移除“移除后能使
+    全体交集覆盖率提升最多”的一个候选；同分时优先移除自身覆盖率更低者。
+    因此规则确定、可审计，也不会凭经验静默删因子。
+    """
+    if not feature_spec:
+        raise ValueError("候选池不能为空。")
+    positions = {date: index for index, date in enumerate(calendar)}
+    first_position = positions[schedule_dates.min()] - sequence_length + 1
+    if first_position < 0:
+        raise ValueError("候选池覆盖率审计缺少序列预热日期。")
+    feature_dates = calendar[first_position : positions[schedule_dates.max()] + 1]
+    target_panel = universe_panel.loc[
+        universe_panel["date"].isin(schedule_dates), ["date", "instrument"]
+    ].drop_duplicates()
+    target_index = pd.MultiIndex.from_frame(target_panel)
+    if target_index.empty:
+        raise ValueError("候选池覆盖率审计的动态股票池为空。")
+
+    if show_progress:
+        _selection_progress(
+            "审计候选池完整序列覆盖率",
+            started_at,
+            detail=f"候选 {len(feature_spec)} 个，序列 {sequence_length} 日",
+        )
+    feature_panel = _load_training_features(
+        feature_spec,
+        feature_dates,
+        calendar,
+        instruments,
+        show_progress,
+    )
+    flags = []
+    for position, item in enumerate(feature_spec, start=1):
+        matrix = (
+            feature_panel.pivot(
+                index="date",
+                columns="instrument",
+                values=item["feature_name"],
+            )
+            .reindex(index=feature_dates, columns=instruments)
+        )
+        ready = (
+            matrix.notna().astype(int)
+            .rolling(sequence_length, min_periods=sequence_length)
+            .sum()
+            .eq(sequence_length)
+            .reindex(schedule_dates)
+            .stack()
+        )
+        flags.append(ready.reindex(target_index).fillna(False).to_numpy(dtype=bool))
+        if show_progress:
+            _selection_progress(
+                "审计候选池完整序列覆盖率",
+                started_at,
+                position,
+                len(feature_spec),
+                detail=item["feature_name"],
+            )
+
+    flag_matrix = np.column_stack(flags)
+    active = list(range(len(feature_spec)))
+
+    def coverage(indices):
+        return float(flag_matrix[:, indices].all(axis=1).mean())
+
+    initial_coverage = coverage(active)
+    audit_rows = []
+    while (
+        coverage(active) < minimum_coverage
+        and len(active) > minimum_feature_count
+    ):
+        before = coverage(active)
+        options = []
+        for remove_index in active:
+            remaining = [index for index in active if index != remove_index]
+            after = coverage(remaining)
+            own_coverage = float(flag_matrix[:, remove_index].mean())
+            options.append((after, -own_coverage, feature_spec[remove_index]["feature_name"], remove_index))
+        # after 越高越好；自身覆盖率越低越优先移除；名称保证最终平局稳定。
+        after, _, _, remove_index = sorted(
+            options, key=lambda item: (-item[0], -item[1], item[2])
+        )[0]
+        item = feature_spec[remove_index]
+        audit_rows.append(
+            {
+                "step": len(audit_rows) + 1,
+                "removed_feature_name": item["feature_name"],
+                "removed_factor_name": item["factor_name"],
+                "removed_params": dict(item["params"]),
+                "coverage_before": before,
+                "coverage_after": after,
+                "coverage_gain": after - before,
+                "removed_single_feature_coverage": float(
+                    flag_matrix[:, remove_index].mean()
+                ),
+                "remaining_feature_count": len(active) - 1,
+            }
+        )
+        active.remove(remove_index)
+        if show_progress:
+            _selection_progress(
+                "按覆盖率移除候选特征",
+                started_at,
+                len(audit_rows),
+                len(feature_spec) - minimum_feature_count,
+                detail=(
+                    f"移除 {item['feature_name']}，交集覆盖率 "
+                    f"{before:.2%} → {after:.2%}"
+                ),
+            )
+
+    final_coverage = coverage(active)
+    if final_coverage < minimum_coverage:
+        raise ValueError(
+            "即使已按规则移除候选特征，完整序列交集覆盖率仍未达到门槛："
+            f"{final_coverage:.2%} < {minimum_coverage:.2%}。"
+        )
+    selected = [feature_spec[index] for index in active]
+    return selected, pd.DataFrame(audit_rows), {
+        "initial_coverage": initial_coverage,
+        "final_coverage": final_coverage,
+        "minimum_coverage": minimum_coverage,
+        "initial_feature_count": len(feature_spec),
+        "remaining_feature_count": len(selected),
+        "target_stock_date_count": len(target_index),
+    }
+
+
+def _make_inference_context(model_bundle, cpu_threads):
+    bundle = _validate_model_bundle(model_bundle)
+    torch, _, _, _, _ = _require_torch()
+    torch.set_num_threads(int(cpu_threads))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, _ = _build_gru_model(bundle["model_config"])
+    model.load_state_dict(bundle["model_state_dict"], strict=True)
+    model.to(device)
+    model.eval()
+    return bundle, torch, model, device
+
+
+def _predict_from_inference_context(
+    context,
+    sequences,
+    batch_size,
+    show_progress=False,
+    started_at=None,
+    stage="验证期推理",
+    detail="",
+):
+    bundle, torch, model, device = context
+    standardized = _transform_sequences_for_model(sequences, bundle)
+    started = time.perf_counter() if started_at is None else started_at
+    results = []
+    total = int(math.ceil(len(standardized) / batch_size))
+    with torch.no_grad():
+        for position, start in enumerate(range(0, len(standardized), batch_size), start=1):
+            values = torch.tensor(
+                standardized[start : start + batch_size], dtype=torch.float32, device=device
+            )
+            results.append(model(values).detach().cpu().numpy().reshape(-1))
+            if show_progress:
+                _selection_progress(
+                    stage,
+                    started,
+                    position,
+                    total,
+                    detail=detail,
+                )
+    if show_progress:
+        print()
+    return np.concatenate(results).astype(float, copy=False)
+
+
+def _newey_west_mean_statistics(values, lags):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    count = len(values)
+    if count == 0:
+        return np.nan, np.nan, np.nan
+    mean = float(values.mean())
+    if count == 1:
+        return mean, np.nan, np.nan
+    centered = values - mean
+    long_run_variance = float(np.mean(centered * centered))
+    maximum_lag = min(int(lags), count - 1)
+    for lag in range(1, maximum_lag + 1):
+        weight = 1.0 - lag / (maximum_lag + 1.0)
+        covariance = float(np.mean(centered[lag:] * centered[:-lag]))
+        long_run_variance += 2.0 * weight * covariance
+    long_run_variance = max(long_run_variance, 0.0)
+    standard_error = math.sqrt(long_run_variance / count)
+    t_value = mean / standard_error if standard_error > 0 else np.nan
+    return mean, standard_error, t_value
+
+
+def _validation_metrics(
+    dates,
+    instruments,
+    targets,
+    scores,
+    expected_label_count,
+    minimum_stocks,
+    top_quantile,
+    hac_lags,
+    lcb_z,
+):
+    frame = pd.DataFrame(
+        {
+            "date": pd.DatetimeIndex(dates),
+            "instrument": instruments,
+            "target": np.asarray(targets, dtype=float),
+            "score": np.asarray(scores, dtype=float),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    rankic_rows = []
+    diagnostics = []
+    for date, group in frame.groupby("date", sort=True):
+        if len(group) < minimum_stocks:
+            continue
+        rank_score = group["score"].rank(method="average").to_numpy()
+        rank_target = group["target"].rank(method="average").to_numpy()
+        if np.std(rank_score) == 0 or np.std(rank_target) == 0:
+            continue
+        rank_ic = float(np.corrcoef(rank_score, rank_target)[0, 1])
+        selected_count = max(1, int(math.ceil(len(group) * top_quantile)))
+        ordered = group.sort_values("score", ascending=False, kind="mergesort")
+        top = ordered.iloc[:selected_count]
+        bottom = ordered.iloc[-selected_count:]
+        rankic_rows.append({"date": date, "rank_ic": rank_ic, "sample_count": len(group)})
+        diagnostics.append(
+            {
+                "date": date,
+                "sample_count": len(group),
+                "rank_ic": rank_ic,
+                "top_count": selected_count,
+                "top_quantile_return": float(top["target"].mean()),
+                "universe_mean_return": float(group["target"].mean()),
+                "top_quantile_excess": float(top["target"].mean() - group["target"].mean()),
+                "top_bottom_spread": float(top["target"].mean() - bottom["target"].mean()),
+                "top_positive": bool(top["target"].mean() > 0),
+            }
+        )
+    rankic_series = pd.DataFrame(rankic_rows)
+    diagnostic_frame = pd.DataFrame(diagnostics)
+    values = rankic_series["rank_ic"].to_numpy(dtype=float) if not rankic_series.empty else np.array([])
+    mean, standard_error, hac_t = _newey_west_mean_statistics(values, hac_lags)
+    return {
+        "rankic_series": rankic_series,
+        "quantile_diagnostics": diagnostic_frame,
+        "rank_ic_mean": mean,
+        "rank_ic_hac_se": standard_error,
+        "rank_ic_hac_t": hac_t,
+        "rank_ic_lcb": mean - lcb_z * standard_error if np.isfinite(standard_error) else np.nan,
+        "positive_rankic_ratio": float(np.mean(values > 0)) if len(values) else np.nan,
+        "valid_date_count": int(len(rankic_series)),
+        "coverage": float(len(frame) / expected_label_count) if expected_label_count else 0.0,
+        "top_quantile_return_mean": (
+            float(diagnostic_frame["top_quantile_return"].mean()) if not diagnostic_frame.empty else np.nan
+        ),
+        "top_quantile_excess_mean": (
+            float(diagnostic_frame["top_quantile_excess"].mean()) if not diagnostic_frame.empty else np.nan
+        ),
+        "top_bottom_spread_mean": (
+            float(diagnostic_frame["top_bottom_spread"].mean()) if not diagnostic_frame.empty else np.nan
+        ),
+        "top_positive_date_ratio": (
+            float(diagnostic_frame["top_positive"].mean()) if not diagnostic_frame.empty else np.nan
+        ),
+    }
+
+
+def _selection_metrics_row(name, metrics):
+    return {
+        "feature_set_id": name,
+        "feature_count": None,
+        "rank_ic_mean": metrics["rank_ic_mean"],
+        "rank_ic_hac_se": metrics["rank_ic_hac_se"],
+        "rank_ic_hac_t": metrics["rank_ic_hac_t"],
+        "rank_ic_lcb": metrics["rank_ic_lcb"],
+        "positive_rankic_ratio": metrics["positive_rankic_ratio"],
+        "valid_date_count": metrics["valid_date_count"],
+        "coverage": metrics["coverage"],
+        "top_quantile_excess_mean": metrics["top_quantile_excess_mean"],
+        "top_bottom_spread_mean": metrics["top_bottom_spread_mean"],
+    }
+
+
+def select_gan_gru_features(
+    *,
+    selection_start_date,
+    selection_end_date,
+    candidate_spec=None,
+    candidate_source=None,
+    universe=None,
+    evaluation_interval_days=5,
+    label_horizon_days=None,
+    training_config=None,
+    selection_config=None,
+    show_progress=True,
+):
+    """为 GAN-GRU 选择模型相关、低冗余的基础或复合因子特征。
+
+    ``candidate_spec`` 用于手工指定初始池；例如
+    ``{"return_nd": [{"window": 5}], "book_to_price": None}``。
+    ``candidate_source`` 可传入 ``"base_factors"``、``"composite_factors"``
+    或二者的列表，函数会读取各因子的 ``candidate_instances`` 展开实例。
+
+    本函数只使用 selection 区间内的信号日训练和验证。后续回测起止日的
+    选择由调用者负责；函数不把 selection 区间与未来回测期作任何隐式绑定。
+    """
+    started_at = time.perf_counter()
+    try:
+        start = pd.Timestamp(selection_start_date).normalize()
+        end = pd.Timestamp(selection_end_date).normalize()
+        if pd.isna(start) or pd.isna(end) or start > end:
+            raise ValueError("selection_start_date 和 selection_end_date 必须是递增有效日期。")
+        interval = _selection_positive_integer(
+            evaluation_interval_days, "evaluation_interval_days"
+        )
+        config = _normalize_feature_selection_config(selection_config)
+        full_training_config = _normalize_training_config(training_config)
+        horizon = (
+            full_training_config["label_horizon_days"]
+            if label_horizon_days is None
+            else _selection_positive_integer(label_horizon_days, "label_horizon_days")
+        )
+        if horizon != full_training_config["label_horizon_days"]:
+            full_training_config = dict(full_training_config)
+            full_training_config["label_horizon_days"] = horizon
+        screening_training_config = dict(full_training_config)
+        screening_training_config.update(
+            {
+                "gan_epochs": min(
+                    screening_training_config["gan_epochs"], config["screening_gan_epochs"]
+                ),
+                "gru_max_epochs": min(
+                    screening_training_config["gru_max_epochs"], config["screening_gru_max_epochs"]
+                ),
+                "early_stop_patience": min(
+                    screening_training_config["early_stop_patience"], config["screening_early_stop_patience"]
+                ),
+            }
+        )
+
+        if show_progress:
+            _selection_progress("展开初始候选因子池", started_at)
+        candidates = _expand_feature_selection_candidates(
+            candidate_spec, candidate_source
+        )
+        full_feature_spec = _normalize_feature_spec(
+            [
+                {
+                    "factor_name": item["factor_name"],
+                    "params": item["params"],
+                    "feature_name": item["feature_name"],
+                }
+                for item in candidates
+            ]
+        )
+
+        from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+            get_factor_data_requirements,
+        )
+
+        maximum_history = full_training_config["sequence_length"] - 1
+        for item in full_feature_spec:
+            requirements = get_factor_data_requirements(
+                item["factor_name"], item["params"]
+            )
+            maximum_history = max(
+                maximum_history + 0,
+                full_training_config["sequence_length"] - 1
+                + int(requirements["data_window"]["lookback_trading_days"]),
+            )
+        if show_progress:
+            _selection_progress("读取交易日历并生成筛选计划", started_at)
+        calendar, available_dates = _load_selection_calendar(
+            start, end, maximum_history, horizon
+        )
+        schedule_dates = available_dates[::interval]
+        if len(schedule_dates) < 8:
+            raise ValueError("筛选区间的有效信号日不足 8 个；请扩大日期区间或缩短频率。")
+        positions = {date: index for index, date in enumerate(calendar)}
+
+        if show_progress:
+            _selection_progress(
+                "读取并校验点时股票池",
+                started_at,
+                detail=f"{len(schedule_dates)} 个信号日",
+            )
+        universe_config, universe_panel, load_instruments = _resolve_selection_universe(
+            universe, available_dates, show_progress, started_at
+        )
+        if load_instruments is not None and not load_instruments:
+            raise ValueError("动态股票池没有可加载的股票代码。")
+
+        # 严格覆盖率门槛只服务于“候选池压缩”：它不训练模型，也不改动基础
+        # 因子定义。压缩完成后，正式模型仍可按 training_config 选择 strict
+        # 或 impute_with_mask 模式。
+        (
+            full_feature_spec,
+            candidate_pool_pruning_audit,
+            candidate_pool_coverage,
+        ) = _prune_candidate_pool_by_coverage(
+            full_feature_spec,
+            calendar,
+            schedule_dates,
+            universe_panel,
+            load_instruments,
+            full_training_config["sequence_length"],
+            config["candidate_pool_min_coverage"],
+            config["candidate_pool_min_feature_count"],
+            show_progress,
+            started_at,
+        )
+        kept_feature_names = {
+            item["feature_name"] for item in full_feature_spec
+        }
+        candidates = [
+            item for item in candidates
+            if item["feature_name"] in kept_feature_names
+        ]
+        if show_progress:
+            _selection_progress(
+                "候选池覆盖率压缩完成",
+                started_at,
+                detail=(
+                    f"{candidate_pool_coverage['initial_feature_count']} → "
+                    f"{candidate_pool_coverage['remaining_feature_count']} 个特征，"
+                    f"覆盖率 {candidate_pool_coverage['initial_coverage']:.2%} → "
+                    f"{candidate_pool_coverage['final_coverage']:.2%}"
+                ),
+            )
+
+        validation_count = max(2, int(math.ceil(len(schedule_dates) * (1.0 - config["train_ratio"]))))
+        if validation_count >= len(schedule_dates):
+            raise ValueError("筛选区间不足以划分训练期和验证期。")
+        validation_dates = schedule_dates[-validation_count:]
+        validation_start_position = positions[validation_dates.min()]
+        additional_purge = config["additional_purge_trading_days"]
+        train_dates = pd.DatetimeIndex(
+            [
+                date
+                for date in schedule_dates
+                if positions[date] + horizon + additional_purge < validation_start_position
+            ]
+        )
+        if len(train_dates) < 4:
+            raise ValueError("按标签期限净化后训练期不足；请扩大筛选区间。")
+
+        train_end = train_dates.max()
+        training_anchor = calendar[positions[train_end] + horizon]
+        if show_progress:
+            _selection_progress(
+                "训练筛选用 GAN-GRU 模型",
+                started_at,
+                detail=(
+                    f"候选特征 {len(full_feature_spec)} 个，训练 {len(train_dates)} 日，"
+                    f"验证 {len(validation_dates)} 日"
+                ),
+            )
+        screening_bundle = train_gan_gru_model(
+            anchor_date=training_anchor,
+            feature_spec=full_feature_spec,
+            instruments=load_instruments,
+            training_config=screening_training_config,
+            training_start_date=train_dates.min(),
+            training_end_date=train_end,
+            universe_panel=universe_panel,
+            show_progress=show_progress,
+            progress_every=1,
+        )
+
+        feature_start_position = validation_start_position - full_training_config["sequence_length"] + 1
+        if feature_start_position < 0:
+            raise ValueError("验证期缺少 GAN-GRU 推理序列预热数据。")
+        feature_dates = calendar[
+            feature_start_position : positions[validation_dates.max()] + 1
+        ]
+        if show_progress:
+            _selection_progress("准备验证期特征和完整未来收益标签", started_at)
+        validation_feature_panel = _load_training_features(
+            full_feature_spec,
+            feature_dates,
+            calendar,
+            load_instruments,
+            show_progress,
+        )
+        validation_labels = _load_forward_labels(
+            validation_dates,
+            calendar,
+            load_instruments,
+            horizon,
+            show_progress=show_progress,
+        )
+        validation_labels = _filter_to_selection_universe(
+            validation_labels, universe_panel, "validation_labels"
+        )
+        expected_label_count = len(validation_labels)
+        if expected_label_count == 0:
+            raise ValueError("按股票池过滤后验证期没有完整未来收益标签。")
+        validation_x, validation_y, validation_sample_dates, validation_instruments = _build_validation_samples(
+            validation_feature_panel,
+            validation_labels,
+            [item["feature_name"] for item in full_feature_spec],
+            validation_dates,
+            calendar,
+            full_training_config["sequence_length"],
+            full_training_config["missing_data_config"],
+            show_progress,
+            started_at,
+        )
+        if config["hac_lags"] is None:
+            hac_lags = max(0, int(math.ceil(horizon / interval)) - 1)
+        else:
+            hac_lags = config["hac_lags"]
+        inference_context = _make_inference_context(
+            screening_bundle, full_training_config["cpu_threads"]
+        )
+        baseline_scores = _predict_from_inference_context(
+            inference_context,
+            validation_x,
+            full_training_config["batch_size"],
+            show_progress=show_progress,
+            started_at=started_at,
+            stage="筛选模型验证期基准推理",
+        )
+        baseline_metrics = _validation_metrics(
+            validation_sample_dates,
+            validation_instruments,
+            validation_y,
+            baseline_scores,
+            expected_label_count,
+            config["min_rankic_stocks"],
+            config["top_quantile"],
+            hac_lags,
+            config["rankic_lcb_z"],
+        )
+
+        if show_progress:
+            _selection_progress(
+                "执行特征置换重要性检验",
+                started_at,
+                completed=0,
+                total=len(full_feature_spec) * config["permutation_repeats"],
+            )
+        date_indices = [
+            positions
+            for _, positions in pd.Series(
+                np.arange(len(validation_sample_dates)), index=validation_sample_dates
+            ).groupby(level=0)
+        ]
+        rng = np.random.default_rng(full_training_config["random_seed"])
+        importance_rows = []
+        total_tests = len(full_feature_spec) * config["permutation_repeats"]
+        test_position = 0
+        for feature_index, item in enumerate(full_feature_spec):
+            impacts = []
+            for repeat in range(1, config["permutation_repeats"] + 1):
+                test_position += 1
+                permuted = validation_x.copy()
+                for indices in date_indices:
+                    if len(indices) > 1:
+                        permuted[indices, :, feature_index] = permuted[
+                            rng.permutation(indices), :, feature_index
+                        ]
+                scores = _predict_from_inference_context(
+                    inference_context,
+                    permuted,
+                    full_training_config["batch_size"],
+                    show_progress=show_progress,
+                    started_at=started_at,
+                    stage="置换重要性推理",
+                    detail=f"{item['feature_name']}，重复 {repeat}/{config['permutation_repeats']}",
+                )
+                metrics = _validation_metrics(
+                    validation_sample_dates,
+                    validation_instruments,
+                    validation_y,
+                    scores,
+                    expected_label_count,
+                    config["min_rankic_stocks"],
+                    config["top_quantile"],
+                    hac_lags,
+                    config["rankic_lcb_z"],
+                )
+                impact = baseline_metrics["rank_ic_lcb"] - metrics["rank_ic_lcb"]
+                impacts.append(impact)
+                if show_progress:
+                    _selection_progress(
+                        "执行特征置换重要性检验",
+                        started_at,
+                        test_position,
+                        total_tests,
+                        detail=f"当前 {item['feature_name']}，重复 {repeat}",
+                    )
+            candidate = candidates[feature_index]
+            importance_rows.append(
+                {
+                    **candidate,
+                    "importance_mean": float(np.nanmean(impacts)),
+                    "importance_std": float(np.nanstd(impacts, ddof=0)),
+                    "permutation_impacts": impacts,
+                }
+            )
+        importance = pd.DataFrame(importance_rows).sort_values(
+            ["importance_mean", "importance_std", "candidate_id"],
+            ascending=[False, True, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        importance["importance_rank"] = np.arange(1, len(importance) + 1)
+
+        max_features = (
+            len(importance)
+            if config["max_selected_features"] is None
+            else min(config["max_selected_features"], len(importance))
+        )
+        ranked_feature_spec = [
+            {
+                "factor_name": row.factor_name,
+                "params": dict(row.params),
+                "feature_name": row.feature_name,
+            }
+            for row in importance.itertuples(index=False)
+        ]
+        final_counts = sorted(
+            {
+                count
+                for count in config["final_feature_counts"]
+                if count <= max_features
+            }
+        )
+        if not final_counts:
+            final_counts = [max_features]
+
+        final_rows = []
+        final_details = []
+        for position, count in enumerate(final_counts, start=1):
+            subset = ranked_feature_spec[:count]
+            if show_progress:
+                _selection_progress(
+                    "复训确认候选特征集合",
+                    started_at,
+                    position - 1,
+                    len(final_counts),
+                    detail=f"前 {count} 个特征",
+                )
+            bundle = train_gan_gru_model(
+                anchor_date=training_anchor,
+                feature_spec=subset,
+                instruments=load_instruments,
+                training_config=full_training_config,
+                training_start_date=train_dates.min(),
+                training_end_date=train_end,
+                universe_panel=universe_panel,
+                show_progress=show_progress,
+                progress_every=1,
+            )
+            names = [item["feature_name"] for item in subset]
+
+            # 重要：不能从“全部候选因子共同完整”的 validation_x 中切列。
+            # 否则任一未入选候选因子的缺失都会错误降低当前子集的覆盖率。
+            # 正式确认必须仅按 subset 自己的字段重新构建验证期面板与序列。
+            if show_progress:
+                _selection_progress(
+                    "重建复训集合验证样本",
+                    started_at,
+                    position - 1,
+                    len(final_counts),
+                    detail=f"前 {count} 个特征，独立计算验证期面板",
+                )
+            subset_validation_feature_panel = _load_training_features(
+                subset,
+                feature_dates,
+                calendar,
+                load_instruments,
+                show_progress,
+            )
+            (
+                subset_x,
+                subset_y,
+                subset_sample_dates,
+                subset_instruments,
+            ) = _build_validation_samples(
+                subset_validation_feature_panel,
+                validation_labels,
+                names,
+                validation_dates,
+                calendar,
+                full_training_config["sequence_length"],
+                full_training_config["missing_data_config"],
+                show_progress,
+                started_at,
+            )
+            if len(subset_x) == 0:
+                raise ValueError(
+                    f"前 {count} 个特征在验证期没有任何完整模型序列。"
+                )
+            context = _make_inference_context(bundle, full_training_config["cpu_threads"])
+            scores = _predict_from_inference_context(
+                context,
+                subset_x,
+                full_training_config["batch_size"],
+                show_progress=show_progress,
+                started_at=started_at,
+                stage="复训集合验证期推理",
+                detail=f"前 {count} 个特征",
+            )
+            metrics = _validation_metrics(
+                subset_sample_dates,
+                subset_instruments,
+                subset_y,
+                scores,
+                expected_label_count,
+                config["min_rankic_stocks"],
+                config["top_quantile"],
+                hac_lags,
+                config["rankic_lcb_z"],
+            )
+            row = _selection_metrics_row(f"top_{count}", metrics)
+            row["feature_count"] = count
+            row["feature_names"] = names
+            row["validation_sample_count"] = len(subset_y)
+            final_rows.append(row)
+            final_details.append(
+                {
+                    "feature_spec": subset,
+                    "metrics": metrics,
+                    "model_bundle": bundle,
+                    "validation_sample_count": len(subset_y),
+                }
+            )
+            if show_progress:
+                _selection_progress(
+                    "复训确认候选特征集合",
+                    started_at,
+                    position,
+                    len(final_counts),
+                    detail=f"前 {count} 个特征，RankIC-LCB={metrics['rank_ic_lcb']:.6f}",
+                )
+        final_ranking = pd.DataFrame(final_rows).sort_values(
+            ["rank_ic_lcb", "rank_ic_mean", "positive_rankic_ratio", "coverage"],
+            ascending=[False, False, False, False],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        best_id = final_ranking.iloc[0]["feature_set_id"]
+        best_detail = next(
+            item for item in final_details if f"top_{len(item['feature_spec'])}" == best_id
+        )
+        qualification = {
+            "coverage_passed": bool(best_detail["metrics"]["coverage"] >= config["min_coverage"]),
+            "positive_rankic_ratio_passed": bool(
+                best_detail["metrics"]["positive_rankic_ratio"] >= config["min_positive_rankic_ratio"]
+            ),
+            "rank_ic_positive": bool(best_detail["metrics"]["rank_ic_mean"] > 0),
+        }
+        qualification["passed"] = bool(all(qualification.values()))
+
+        interactions = pd.DataFrame(
+            columns=["feature_a", "feature_b", "impact_a", "impact_b", "joint_impact", "interaction"]
+        )
+        if config["max_interaction_pairs"] > 0 and len(importance) > 1:
+            interaction_features = importance.head(max_features).reset_index(drop=True)
+            pairs = [
+                (left, right)
+                for left in range(len(interaction_features))
+                for right in range(left + 1, len(interaction_features))
+            ][: config["max_interaction_pairs"]]
+            rows = []
+            for position, (left, right) in enumerate(pairs, start=1):
+                working = validation_x.copy()
+                for indices in date_indices:
+                    if len(indices) > 1:
+                        for feature_index in (left, right):
+                            original_index = importance.loc[feature_index, "importance_rank"] - 1
+                            working[indices, :, original_index] = working[
+                                rng.permutation(indices), :, original_index
+                            ]
+                scores = _predict_from_inference_context(
+                    inference_context, working, full_training_config["batch_size"],
+                    show_progress=show_progress, started_at=started_at,
+                    stage="特征交互置换推理",
+                    detail=f"{position}/{len(pairs)}",
+                )
+                metrics = _validation_metrics(
+                    validation_sample_dates, validation_instruments, validation_y, scores,
+                    expected_label_count, config["min_rankic_stocks"], config["top_quantile"],
+                    hac_lags, config["rankic_lcb_z"],
+                )
+                joint_impact = baseline_metrics["rank_ic_lcb"] - metrics["rank_ic_lcb"]
+                impact_left = interaction_features.loc[left, "importance_mean"]
+                impact_right = interaction_features.loc[right, "importance_mean"]
+                rows.append(
+                    {
+                        "feature_a": interaction_features.loc[left, "feature_name"],
+                        "feature_b": interaction_features.loc[right, "feature_name"],
+                        "impact_a": impact_left,
+                        "impact_b": impact_right,
+                        "joint_impact": joint_impact,
+                        "interaction": joint_impact - impact_left - impact_right,
+                    }
+                )
+            interactions = pd.DataFrame(rows)
+
+        if show_progress:
+            _selection_progress(
+                "特征筛选完成",
+                started_at,
+                len(final_counts),
+                len(final_counts),
+                detail=(
+                    f"选择 {len(best_detail['feature_spec'])} 个特征，"
+                    f"RankIC-LCB={best_detail['metrics']['rank_ic_lcb']:.6f}"
+                ),
+            )
+        return {
+            "selected_feature_spec": copy.deepcopy(best_detail["feature_spec"]),
+            "selection_passed": qualification["passed"],
+            "qualification": qualification,
+            "feature_importance": importance,
+            "final_feature_set_ranking": final_ranking,
+            "screening_candidate_metrics": baseline_metrics,
+            "baseline_metrics": baseline_metrics,
+            "selected_metrics": best_detail["metrics"],
+            "selected_rankic_series": best_detail["metrics"]["rankic_series"],
+            "selected_quantile_diagnostics": best_detail["metrics"]["quantile_diagnostics"],
+            "interaction_results": interactions,
+            "candidate_pool_coverage": candidate_pool_coverage,
+            "candidate_pool_pruning_audit": candidate_pool_pruning_audit,
+            "resolved_candidates": pd.DataFrame(candidates),
+            "universe_config": universe_config,
+            "universe_panel": universe_panel,
+            "selection_schedule": pd.DataFrame({"date": schedule_dates}),
+            "train_dates": train_dates,
+            "validation_dates": validation_dates,
+            "training_anchor_date": training_anchor,
+            "selection_config": config,
+            "training_config": full_training_config,
+            "screening_training_config": screening_training_config,
+            "label_horizon_days": horizon,
+            "hac_lags": hac_lags,
+        }
     finally:
         if show_progress:
             print()
@@ -2080,6 +3738,7 @@ def _persist_model_bundle(run_directory, model_bundle, update_count):
             pickle.dump(bundle["scaler"], handle, protocol=pickle.HIGHEST_PROTOCOL)
         state_payload = {
             "model_config": bundle["model_config"],
+            "missing_data_config": bundle["missing_data_config"],
             "feature_spec": bundle["feature_spec"],
             "feature_schema_hash": bundle["feature_schema_hash"],
             "training_metadata": bundle["training_metadata"],
@@ -2157,6 +3816,7 @@ def _load_persisted_model_bundle(run_directory):
         "model_state_dict": model_state_dict,
         "scaler": scaler,
         "model_config": state["model_config"],
+        "missing_data_config": state.get("missing_data_config"),
         "feature_spec": state["feature_spec"],
         "feature_schema_hash": state["feature_schema_hash"],
         "training_metadata": state.get("training_metadata", {}),
@@ -2377,6 +4037,7 @@ def build_model_state_provider(
 FACTOR = {
     "name": "gan_gru_score",
     "func": calc_gan_gru_score,
+    "factor_type": "machine_learning",
     "input_schema": {
         "required": {"date": {}, "instrument": {}},
         "conditional": {},
@@ -2413,6 +4074,9 @@ FACTOR = {
         # 可配置项仅限该常量中已经登记的键；未知参数会报错。
         # sequence_length 同时决定 loader 预存多少个特征截面；
         # retrain_interval_days 决定模型按多少个交易日更新一次。
+        # missing_feature_mode='strict' 保持传统完整序列口径；
+        # 'impute_with_mask' 使用训练期均值填补缺失，并把缺失掩码拼接入模型输入。
+        # minimum_observed_value_ratio 限制单条序列最少真实观测比例。
         # 固定模型模式不接受该参数。
         "training_config": {"default": None},
 
@@ -2476,6 +4140,56 @@ feature_spec = [
 - 列表顺序就是模型输入维度顺序，不只是展示顺序。
 
 滚动模式不传 `feature_spec` 时使用 `DEFAULT_FEATURE_SPEC`，即模型4对应的20项默认特征。一次滚动运行首次训练后，特征数量、组合、参数和顺序全部固定；如需更改，必须启动新的运行实例。
+
+## 训练前的特征筛选
+
+`select_gan_gru_features()` 是本机器学习因子的配套研究函数，不属于因子计算接口。
+它先以候选特征训练一套低预算筛选模型，再在验证期逐特征进行截面内置换推理，使用
+RankIC-LCB 的下降幅度衡量模型对该特征的依赖；随后只对少量前 N 个特征集合按正式训练
+参数复训确认。正式复训确认会仅根据该特征集合重新加载验证期面板、构造序列并计算覆盖率，
+不会继承“全部候选特征共同完整样本”的覆盖率。返回的 `selected_feature_spec` 可直接作为
+本因子滚动训练模式的 `feature_spec`。
+
+在训练筛选模型之前，函数先按 `candidate_pool_min_coverage` 审计所有候选的严格完整
+序列交集覆盖率。若不达标，会逐次移除“移除后交集覆盖率提升最多”的候选，直至达到门槛；
+全过程返回 `candidate_pool_pruning_audit` 和 `candidate_pool_coverage`，不会静默删因子。
+这一步仅处理候选池，不修改任何基础因子的经济定义。
+
+## 缺失特征放宽模式
+
+`training_config["missing_feature_mode"]` 可选：
+
+- `"strict"`：默认值。任一特征在序列内缺失，整条股票序列不参与训练或推理；与旧版结果兼容。
+- `"impute_with_mask"`：允许部分特征缺失。每个缺失值仅用训练子集对应特征的均值填补，
+  同时向 GRU 追加同维度缺失掩码（1 表示填补、0 表示原始值）。模型因此不会把填补值误认为
+  真实观测，也不会使用验证期、回测期或推理期数据重新拟合填补值。
+
+放宽模式仍受 `minimum_observed_value_ratio` 约束，默认至少 50% 的“时间 × 特征”位置必须有
+真实值；完全或几乎完全缺失的序列仍不产生分数。模型包会固化该模式与训练期 scaler，固定模型
+推理及滚动更新均必须沿用同一协议。
+
+候选池有两种来源，可同时使用并自动去重：
+
+```python
+# 手工指定：None 表示展开该因子的 FACTOR['candidate_instances']。
+candidate_spec = {
+    "return_nd": [{"window": 5}, {"window": 20}],
+    "book_to_price": None,
+}
+
+# 由 FACTOR['factor_type'] 批量发现所有登记实例。
+candidate_source = ["base_factors", "composite_factors"]
+```
+
+筛选必须明确传入 `universe`，支持：
+
+- `{"type": "market_cap_groups", "group_count": 15, "selected_groups": [1, 2]}`；每天按当日市值重新分组。
+- `{"type": "index", "index_codes": ["000300.SH"]}`；每天使用历史指数成分股。
+- `{"type": "custom", "instruments": [...]}`；使用指定代码集合。
+
+它不会接收未来回测起止日，也不会替调用者决定筛选期与回测期的边界；调用者必须在正式回测
+开始前冻结 `selected_feature_spec`。筛选期间只使用已完成的历史未来收益标签。`top_quantile`
+诊断仅按模型分数取每个验证截面最高分股票，并统计其已实现未来收益，不涉及交易、成本或策略回测。
 
 ## 模式一：固定模型
 
