@@ -18,8 +18,10 @@ import hashlib
 import json
 import math
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
@@ -578,14 +580,43 @@ def _positive_class_margin(model, x_values):
 
 
 def _validation_metric(model, validation_frame, feature_names, metric):
+    """计算验证期分类能力及标准的平均横截面 RankIC。
+
+    AUC 保留为所有验证分类样本的 pooled AUC；RankIC 则严格按每一个
+    信号日截面独立计算，再取时间均值，和因子研究中的 RankIC 定义一致。
+    """
     _, roc_auc_score = _require_sklearn()
     x_values = validation_frame[feature_names].to_numpy(dtype=float)
     y_values = validation_frame["label"].to_numpy(dtype=int)
     scores, sign = _positive_class_margin(model, x_values)
     auc = float(roc_auc_score(y_values, scores))
-    rank_ic = float(pd.Series(scores).corr(validation_frame["forward_excess_return"], method="spearman"))
+    rank_ic_panel = validation_frame[
+        ["date", "forward_excess_return"]
+    ].copy()
+    rank_ic_panel["svm_score"] = scores
+    rank_ic_values = []
+    for _, cross_section in rank_ic_panel.groupby("date", sort=True):
+        cross_section = cross_section.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=["svm_score", "forward_excess_return"]
+        )
+        if len(cross_section) < 3:
+            continue
+        value = cross_section["svm_score"].corr(
+            cross_section["forward_excess_return"], method="spearman"
+        )
+        if np.isfinite(value):
+            rank_ic_values.append(float(value))
+    if not rank_ic_values:
+        raise ValueError("验证期不存在可计算横截面 RankIC 的有效信号日。")
+    rank_ic = float(np.mean(rank_ic_values))
     selected = auc if metric == "auc" else rank_ic
-    return {"selected_metric": selected, "auc": auc, "rank_ic": rank_ic, "decision_value_positive_sign": sign}
+    return {
+        "selected_metric": selected,
+        "auc": auc,
+        "rank_ic": rank_ic,
+        "rank_ic_cross_section_count": int(len(rank_ic_values)),
+        "decision_value_positive_sign": sign,
+    }
 
 
 def _render_progress(stage, completed, total, started_at, detail=""):
@@ -692,7 +723,7 @@ def validate_svm_model_bundle(model_bundle):
     return bundle
 
 
-def train_svm_model(
+def _train_svm_from_panel(
     *,
     feature_panel,
     price_panel,
@@ -747,9 +778,36 @@ def train_svm_model(
         raise ValueError("progress_every 必须是正整数。")
 
     raw_features = _validate_feature_panel(feature_panel, feature_names, preprocess_cfg)
-    train_signals = _make_signal_dates(calendar, train_start, train_end, signal_interval_trading_days)
-    validation_signals = _make_signal_dates(calendar, validation_start, validation_end, signal_interval_trading_days)
+    # 信号日必须从同一锚点连续生成后再按时间切分。若训练期和验证期分别
+    # 从各自起点重新按 interval 取样，会使验证期日期与预先计算的特征面板
+    # 错位，造成“有标签但没有验证特征”的隐蔽错误。
+    candidate_signals = _make_signal_dates(
+        calendar,
+        train_start,
+        validation_end,
+        signal_interval_trading_days,
+    )
+    train_signals = candidate_signals[
+        (candidate_signals >= train_start) & (candidate_signals <= train_end)
+    ]
+    validation_signals = candidate_signals[
+        (candidate_signals >= validation_start)
+        & (candidate_signals <= validation_end)
+    ]
+    if len(train_signals) == 0 or len(validation_signals) == 0:
+        raise ValueError("训练期或验证期没有可用信号日，请检查日期区间与调仓频率。")
     all_signals = train_signals.union(validation_signals).sort_values()
+    available_feature_dates = pd.DatetimeIndex(
+        raw_features["date"].unique()
+    ).normalize().unique().sort_values()
+    missing_feature_dates = all_signals.difference(available_feature_dates)
+    if not missing_feature_dates.empty:
+        preview = [date.strftime("%Y-%m-%d") for date in missing_feature_dates[:5]]
+        raise ValueError(
+            "feature_panel 缺少训练/验证信号日特征："
+            f"{preview}（共 {len(missing_feature_dates)} 日）。"
+            "请使用与 training_start_date 相同锚点、连续生成的信号日特征面板。"
+        )
     membership = _resolve_universe_panel(universe, all_signals, raw_features, universe_panel)
     if membership.empty:
         raise ValueError("训练股票池在全部信号日没有可用股票。")
@@ -888,6 +946,9 @@ def train_svm_model(
             "validation_selected_metric": float(best["selected_metric"]),
             "validation_auc": float(best["auc"]),
             "validation_rank_ic": float(best["rank_ic"]),
+            "validation_rank_ic_cross_section_count": int(
+                best["rank_ic_cross_section_count"]
+            ),
             "hyperparameter_results": rows,
         },
         "model_version": str(model_version),
@@ -900,7 +961,7 @@ def train_svm_model(
     return bundle
 
 
-def calc_svm_score(
+def _score_svm_from_panel(
     data,
     target_dates=None,
     as_of_date=None,
@@ -995,6 +1056,338 @@ def calc_svm_score(
     return result.sort_values(["date", "instrument"], kind="mergesort").reset_index(drop=True)
 
 
+class _FactorDataBundleLike(Protocol):
+    """SVM 推理阶段所需的 loader 数据容器最小接口。"""
+
+    def get_dependency(self, dependency_name: str) -> Any:
+        ...
+
+    def get_dependency_target_dates(
+        self, dependency_name: str, final_dates: Sequence[pd.Timestamp]
+    ) -> pd.DatetimeIndex:
+        ...
+
+
+def _load_model_for_runtime(model_bundle, model_artifact_dir):
+    if model_bundle is not None and model_artifact_dir is not None:
+        raise ValueError("model_bundle 与 model_artifact_dir 只能提供一个。")
+    if model_bundle is None:
+        if model_artifact_dir is None:
+            raise ValueError("必须提供 model_bundle 或 model_artifact_dir。")
+        model_bundle = load_svm_model_bundle(model_artifact_dir)
+    return validate_svm_model_bundle(model_bundle)
+
+
+def _resolve_svm_dependencies(params):
+    """供 loader 根据冻结模型包自动预存 10 个基础因子依赖。"""
+    bundle = _load_model_for_runtime(
+        params.get("model_bundle"), params.get("model_artifact_dir")
+    )
+    return {
+        "items": [
+            {
+                "factor_name": item["factor_name"],
+                "factor_params": dict(item["params"]),
+                "feature_name": item["feature_name"],
+            }
+            for item in bundle["feature_spec"]
+        ]
+    }
+
+
+def _factor_output_column(factor_name):
+    from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+        get_factor_metadata,
+    )
+
+    output_schema = get_factor_metadata(factor_name).get("output_schema", {})
+    columns = [name for name in output_schema if name not in {"date", "instrument"}]
+    if len(columns) != 1:
+        raise ValueError(f"依赖因子 {factor_name!r} 必须且只能输出一个数值列。")
+    return columns[0]
+
+
+def _calculate_inference_feature_panel(domain_data, feature_spec, target_dates, show_progress):
+    """使用 loader 已预存的依赖数据计算 SVM 推理所需特征。"""
+    from factor_lib.factor_hub.get_factor import get_factor
+
+    if not callable(getattr(domain_data, "get_dependency", None)):
+        raise TypeError("svm_score 必须接收 loader 返回的 FactorDataBundle。")
+    targets = _normalize_dates(target_dates, "target_dates")
+    pieces, started = [], time.perf_counter()
+    for position, item in enumerate(feature_spec, start=1):
+        feature_name = item["feature_name"]
+        dependency_dates = domain_data.get_dependency_target_dates(feature_name, targets)
+        if show_progress:
+            _render_progress(
+                "推理依赖因子计算",
+                position - 1,
+                len(feature_spec),
+                started,
+                f"{feature_name}：{len(dependency_dates)} 个预存日期",
+            )
+        values = get_factor(
+            item["factor_name"],
+            domain_data.get_dependency(feature_name),
+            target_dates=dependency_dates,
+            as_of_date=targets.max(),
+            show_progress=show_progress,
+            progress_every=1,
+            **item["params"],
+        )
+        value_column = _factor_output_column(item["factor_name"])
+        piece = values.loc[:, ["date", "instrument", value_column]].rename(
+            columns={value_column: feature_name}
+        )
+        pieces.append(piece.loc[pd.to_datetime(piece["date"]).dt.normalize().isin(targets)])
+        if show_progress:
+            _render_progress(
+                "推理依赖因子计算",
+                position,
+                len(feature_spec),
+                started,
+                f"{feature_name} 完成，{len(piece):,} 条",
+            )
+    if show_progress:
+        print()
+    panel = pieces[0]
+    for piece in pieces[1:]:
+        panel = panel.merge(piece, on=["date", "instrument"], how="inner", validate="one_to_one")
+    panel["date"] = pd.to_datetime(panel["date"]).dt.normalize()
+    return panel.sort_values(["date", "instrument"], kind="mergesort").reset_index(drop=True)
+
+
+def _resolve_training_universe(universe, signal_dates):
+    """返回训练期点时股票池面板及仅用于查询优化的代码并集。"""
+    config = _normalize_universe(universe)
+    dates = _normalize_dates(signal_dates, "signal_dates")
+    if config["type"] == "all_a":
+        return config, None, None
+    if config["type"] == "custom":
+        panel = pd.MultiIndex.from_product(
+            [dates, config["instruments"]], names=["date", "instrument"]
+        ).to_frame(index=False)
+        return config, panel, config["instruments"]
+    try:
+        import dai
+    except ImportError as exc:
+        raise ImportError("指数动态股票池需要在 BigQuant 环境运行。") from exc
+    code_sql = ", ".join("'" + code.replace("'", "''") + "'" for code in config["index_codes"])
+    result = dai.query(
+        f"""
+        SELECT date, member_code AS instrument
+        FROM cn_stock_index_component
+        WHERE instrument IN ({code_sql})
+          AND date >= '{dates.min():%Y-%m-%d}'
+          AND date <= '{dates.max():%Y-%m-%d}'
+        """,
+        filters={"date": [dates.min().strftime("%Y-%m-%d"), dates.max().strftime("%Y-%m-%d")]},
+    ).df()
+    result["date"] = pd.to_datetime(result["date"], errors="raise").dt.normalize()
+    panel = result.loc[result["date"].isin(dates), ["date", "instrument"]].drop_duplicates()
+    missing = dates.difference(pd.DatetimeIndex(panel["date"].unique()))
+    if not missing.empty:
+        raise ValueError(f"部分信号日没有指数历史成分股：{[str(x.date()) for x in missing[:5]]}")
+    return config, panel, sorted(panel["instrument"].astype(str).unique().tolist())
+
+
+def _load_training_calendar_with_preheat(train_start, anchor, feature_spec):
+    """按最长因子预热期自适应向前扩展交易日历。"""
+    from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+        get_factor_data_requirements,
+        load_trading_dates,
+    )
+
+    required_preheat = 0
+    for item in feature_spec:
+        window = get_factor_data_requirements(
+            item["factor_name"], item["params"]
+        )["data_window"]
+        required_preheat = max(
+            required_preheat,
+            int(window.get("lookback_trading_days", 0)),
+            int(window.get("minimum_history_observations", 0)),
+        )
+    # 交易日约占自然日的 2/3；初值留出额外缓冲，仍不足时继续扩大。
+    span_calendar_days = max(365, int(required_preheat * 1.7) + 90)
+    for _ in range(6):
+        calendar = _normalize_calendar(
+            load_trading_dates(train_start - pd.Timedelta(days=span_calendar_days), anchor)
+        )
+        available_preheat = int((calendar < train_start).sum())
+        if available_preheat >= required_preheat:
+            return calendar, required_preheat
+        span_calendar_days *= 2
+    raise ValueError(
+        "无法取得训练首个信号日前所需的预热交易日："
+        f"需要 {required_preheat} 日。"
+    )
+
+
+def _load_training_feature_panel(feature_spec, target_dates, calendar, instruments, show_progress, batch_signal_dates=12):
+    """自动读取原始数据并分批计算基础因子，避免一次大查询耗尽平台内存。"""
+    from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+        get_factor_data_requirements,
+        load_factor_raw_data,
+    )
+    from factor_lib.factor_hub.get_factor import get_factor
+
+    targets = _normalize_dates(target_dates, "feature_target_dates")
+    if (
+        not isinstance(batch_signal_dates, (int, np.integer))
+        or isinstance(batch_signal_dates, bool)
+        or batch_signal_dates <= 0
+    ):
+        raise ValueError("batch_signal_dates 必须是正整数。")
+    positions = {date: index for index, date in enumerate(calendar)}
+    chunks = [targets[start:start + batch_signal_dates] for start in range(0, len(targets), batch_signal_dates)]
+    pieces, started = [], time.perf_counter()
+    for feature_position, item in enumerate(feature_spec, start=1):
+        requirements = get_factor_data_requirements(item["factor_name"], item["params"])
+        if requirements["dependencies"] is not None:
+            raise NotImplementedError("SVM 训练特征暂仅支持无下级依赖的基础因子。")
+        window = requirements["data_window"]
+        lookback = max(int(window.get("lookback_trading_days", 0)), int(window.get("minimum_history_observations", 0)))
+        # 输出列由因子元数据决定，与分块无关；在循环外解析可避免
+        # “分块为空时 value_column 未赋值”的歧义，也让静态检查准确。
+        value_column = _factor_output_column(item["factor_name"])
+        parts = []
+        for chunk_position, chunk_dates in enumerate(chunks, start=1):
+            first = positions[chunk_dates.min()]
+            last = positions[chunk_dates.max()]
+            raw_dates = calendar[max(0, first - lookback): last + 1]
+            if show_progress:
+                _render_progress(
+                    "训练特征读取与计算",
+                    feature_position - 1,
+                    len(feature_spec),
+                    started,
+                    f"{item['feature_name']}，分块 {chunk_position}/{len(chunks)}，预热 {lookback} 日",
+                )
+            raw_data = load_factor_raw_data(
+                item["factor_name"], dates=raw_dates,
+                factor_params=requirements["resolved_factor_params"],
+                instruments=instruments, show_progress=show_progress,
+            )
+            values = get_factor(
+                item["factor_name"], raw_data, target_dates=chunk_dates,
+                as_of_date=chunk_dates.max(), show_progress=show_progress,
+                progress_every=1, **item["params"],
+            )
+            parts.append(values.loc[:, ["date", "instrument", value_column]])
+            del raw_data, values
+        if not parts:
+            raise RuntimeError(f"训练特征 {item['feature_name']!r} 未产生任何分块结果。")
+        piece = pd.concat(parts, ignore_index=True).rename(columns={value_column: item["feature_name"]})
+        piece["date"] = pd.to_datetime(piece["date"]).dt.normalize()
+        pieces.append(piece)
+        if show_progress:
+            _render_progress("训练特征读取与计算", feature_position, len(feature_spec), started, f"{item['feature_name']} 完成")
+    if show_progress:
+        print()
+    panel = pieces[0]
+    for piece in pieces[1:]:
+        panel = panel.merge(piece, on=["date", "instrument"], how="inner", validate="one_to_one")
+    return panel.sort_values(["date", "instrument"], kind="mergesort").reset_index(drop=True)
+
+
+def train_svm_model(
+    *, anchor_date, feature_spec, training_start_date, training_end_date,
+    validation_start_date, validation_end_date, universe, label_config=None,
+    preprocessing_config=None, model_config=None, signal_interval_trading_days=20,
+    prediction_label_window_trading_days=20, model_version=None,
+    persist_model_bundle=True, model_artifact_parent_dir=None,
+    refit_on_train_and_validation=True, show_progress=True, progress_every=20,
+):
+    """自动计算 feature_spec 中的基础因子并训练、验证及保存固定 SVM 模型。
+
+    公开接口不接收 feature_panel 或 price_panel；训练数据均由本函数依据
+    feature_spec、universe 和日期边界自动准备。
+    """
+    from factor_lib.common.data_adapters.bigquant_adapters.daily import load_daily_raw_data
+
+    started = time.perf_counter()
+    spec = _normalize_feature_spec(feature_spec)
+    anchor = _as_date(anchor_date, "anchor_date")
+    train_start = _as_date(training_start_date, "training_start_date")
+    train_end = _as_date(training_end_date, "training_end_date")
+    valid_start = _as_date(validation_start_date, "validation_start_date")
+    valid_end = _as_date(validation_end_date, "validation_end_date")
+    if not train_start <= train_end < valid_start <= valid_end <= anchor:
+        raise ValueError("日期必须满足 training_start <= training_end < validation_start <= validation_end <= anchor。")
+    if show_progress:
+        _render_progress("准备训练日历", 0, 1, started, f"{train_start:%Y-%m-%d} 至 {anchor:%Y-%m-%d}")
+    calendar, required_preheat = _load_training_calendar_with_preheat(
+        train_start, anchor, spec
+    )
+    all_signal_candidates = _make_signal_dates(calendar, train_start, valid_end, signal_interval_trading_days)
+    train_signals = all_signal_candidates[all_signal_candidates <= train_end]
+    validation_signals = all_signal_candidates[all_signal_candidates >= valid_start]
+    all_signals = train_signals.union(validation_signals).sort_values()
+    universe_config, universe_panel, load_instruments = _resolve_training_universe(universe, all_signals)
+    if show_progress:
+        _render_progress(
+            "准备训练日历", 1, 1, started,
+            f"信号日 {len(all_signals)} 个，预热 {required_preheat} 日，股票池 {universe_config['type']}",
+        )
+        print()
+    feature_panel = _load_training_feature_panel(spec, all_signals, calendar, load_instruments, show_progress)
+    if show_progress:
+        _render_progress("读取训练标签开盘价", 0, 1, started, f"{train_start:%Y-%m-%d} 至 {anchor:%Y-%m-%d}")
+    price_panel = load_daily_raw_data(["open"], start_date=train_start, end_date=anchor, instruments=load_instruments, show_progress=show_progress)
+    if show_progress:
+        _render_progress("读取训练标签开盘价", 1, 1, started, f"{len(price_panel):,} 行")
+        print()
+    run_id = model_version or f"svm_{universe_config['type']}_fixed_{pd.Timestamp.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+    artifact_dir = None
+    if persist_model_bundle:
+        if not model_artifact_parent_dir:
+            raise ValueError("persist_model_bundle=True 时必须提供 model_artifact_parent_dir。")
+        parent = Path(model_artifact_parent_dir).expanduser().resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+        artifact_dir = parent / run_id
+    bundle = _train_svm_from_panel(
+        feature_panel=feature_panel, price_panel=price_panel, trading_calendar=calendar,
+        feature_spec=spec, training_start_date=train_start, training_end_date=train_end,
+        training_anchor_date=anchor, validation_start_date=valid_start, validation_end_date=valid_end,
+        universe=universe_config, universe_panel=universe_panel,
+        signal_interval_trading_days=signal_interval_trading_days,
+        prediction_label_window_trading_days=prediction_label_window_trading_days,
+        label_config=label_config, preprocessing_config=preprocessing_config,
+        model_config=model_config, model_version=run_id,
+        persist_model_bundle=persist_model_bundle, model_artifact_dir=artifact_dir,
+        refit_on_train_and_validation=refit_on_train_and_validation,
+        show_progress=show_progress, progress_every=progress_every,
+    )
+    bundle["training_metadata"]["feature_preparation"] = "auto_loader_and_get_factor"
+    return bundle
+
+
+def calc_svm_score(
+    data, target_dates=None, as_of_date=None, *, model_bundle=None,
+    model_artifact_dir=None, universe=None, universe_panel=None,
+    domain_data=None, show_progress=True, progress_every=20,
+):
+    """自动计算模型包声明的基础因子并输出固定 SVM 截面评分。"""
+    if not isinstance(data, pd.DataFrame) or not {"date", "instrument"}.issubset(data.columns):
+        raise TypeError("data 必须是 loader 提供的、含 date 和 instrument 的根面板。")
+    bundle = _load_model_for_runtime(model_bundle, model_artifact_dir)
+    if domain_data is None:
+        raise TypeError("svm_score 必须接收 loader 返回的 FactorDataBundle。")
+    targets = _normalize_dates(target_dates, "target_dates")
+    if as_of_date is not None and (targets > _as_date(as_of_date, "as_of_date")).any():
+        raise ValueError("target_dates 不得晚于 as_of_date。")
+    feature_panel = _calculate_inference_feature_panel(domain_data, bundle["feature_spec"], targets, show_progress)
+    effective_universe = bundle["training_universe_config"] if universe is None else universe
+    if _normalize_universe(effective_universe)["type"] == "index" and universe_panel is None:
+        _, universe_panel, _ = _resolve_training_universe(effective_universe, targets)
+    return _score_svm_from_panel(
+        feature_panel, target_dates=targets, as_of_date=as_of_date,
+        universe=effective_universe, universe_panel=universe_panel,
+        model_bundle=bundle, show_progress=show_progress, progress_every=progress_every,
+    )
+
+
 FACTOR = {
     "name": "svm_score",
     "func": calc_svm_score,
@@ -1006,23 +1399,20 @@ FACTOR = {
         "required": {
             "date": {"dtype": "datetime64[ns]", "frequency": "daily", "meaning": "目标因子截面日期。"},
             "instrument": {"dtype": "string", "frequency": "daily", "meaning": "证券唯一标识。"},
-            "dynamic_feature_columns": {"dtype": "float", "frequency": "daily", "meaning": "名称和顺序由 model_bundle.feature_spec 决定。"},
         },
-        "conditional": {
-            "industry": {"dtype": "string", "frequency": "daily", "meaning": "行业中位数填补或行业中性化时使用。", "required_when": {"preprocessing_config": "uses_industry"}},
-            "total_market_cap": {"dtype": "float", "frequency": "daily", "meaning": "市值中性化时使用。", "required_when": {"preprocessing_config": "neutralize_size_industry"}},
-        },
+        "conditional": {"dependency_data": {"meaning": "由 model_bundle.feature_spec 的 dependencies 自动预存和计算。"}},
     },
     "parameters": {
         "target_dates": {"default": None, "accepted_values": "日期或日期序列", "effect": "指定输出截面。", "changes_data_requirements": False},
         "as_of_date": {"default": None, "accepted_values": "日期", "effect": "推理可使用的信息截止日。", "changes_data_requirements": False},
         "universe": {"default": None, "accepted_values": "all_a/custom/index 配置", "effect": "限制目标日输出的点时股票池。", "changes_data_requirements": True},
         "universe_panel": {"default": None, "accepted_values": "date+instrument 历史成员面板", "effect": "指数股票池的历史成员输入。", "changes_data_requirements": True},
-        "model_bundle": {"default": None, "accepted_values": "完整冻结模型包", "effect": "提供内存模型包。", "changes_data_requirements": True},
-        "model_artifact_dir": {"default": None, "accepted_values": "模型文件或目录路径", "effect": "加载受信任的固定模型包。", "changes_data_requirements": False},
+        "model_bundle": {"default": None, "accepted_values": "完整冻结模型包", "effect": "提供模型、特征定义及自动依赖。", "changes_data_requirements": True},
+        "model_artifact_dir": {"default": None, "accepted_values": "模型包目录路径", "effect": "从受信任目录加载模型并自动声明依赖。", "changes_data_requirements": True},
         "show_progress": {"default": True, "accepted_values": "bool", "effect": "显示推理进度。", "changes_data_requirements": False},
         "progress_every": {"default": 20, "accepted_values": "正整数", "effect": "推理进度刷新频率。", "changes_data_requirements": False},
     },
+    "dependencies": {"resolver": _resolve_svm_dependencies},
     "data_window": {
         "lookback_trading_days": 0,
         "requires_target_date_data": True,
@@ -1036,24 +1426,26 @@ FACTOR = {
         "svm_score": {"dtype": "float64", "meaning": "朝训练正类 +1 方向的 SVM 决策分数。"},
     },
     "usage_notes": [
-        "训练与推理均要求显式 universe；指数股票池必须逐日期提供历史成员。",
-        "训练函数不直接查询数据，调用方必须提供点时特征、开盘价和交易日历。",
+        "训练函数自动按 feature_spec 调用 loader/get_factor；公开接口不接收 feature_panel。",
+        "推理通过 dependencies 自动预存并计算模型包记录的基础因子；调用方无需手工拼特征宽表。",
+        "推理不传 universe 时使用模型包冻结的训练股票池；指数股票池自动读取目标日历史成员。",
         "模型包只能由受信任来源加载；joblib/pickle 不适合不可信文件。",
     ],
     "pit_notes": [
-        "训练标签从 T+1 开盘到 T+1+H 开盘；training_anchor_date 必须晚于标签结束日。",
+        "训练标签从 T+1 开盘到 T+1+H 开盘；anchor_date 必须晚于标签结束日。",
         "验证与最终测试必须按时间切分；测试期不参与超参数选择。",
         "推理不构造未来标签，也不根据样本外表现翻转分数。",
     ],
     "status": "research",
-    "version": "0.1.0",
+    "version": "0.2.0",
 }
 
 
 FACTOR_INFO = """# svm_score
 
-固定模型的支持向量机选股评分因子。训练函数 ``train_svm_model`` 只应在研究期
-调用；``calc_svm_score`` 只做推理。高斯核、线性核、多项式核和 Sigmoid 核均受
-支持。模型分数是指向训练标签 +1 类的决策边界 margin，数值越高代表模型越倾向于
-预测该股票属于未来超额收益前分位组。
+固定模型的支持向量机选股评分因子。训练函数 ``train_svm_model`` 自动依据
+``feature_spec`` 调用 loader/get_factor 计算训练特征；``calc_svm_score`` 通过
+模型包声明动态 dependencies，自动计算推理特征。两者都不接收调用方手工拼装的
+feature_panel。高斯核、线性核、多项式核和 Sigmoid 核均受支持；分数越高越接近
+训练标签中的未来超额收益高组。
 """
