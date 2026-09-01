@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
 """固定模型支持向量机选股评分因子。
 
-本模块不查询 BigQuant，也不包含回测或交易逻辑。外层研究代码应准备：
-
-* ``feature_panel``：date、instrument 和 ``feature_spec`` 中每个特征列；
-* ``price_panel``：date、instrument、open，用于训练标签；
-* ``trading_calendar``：严格递增的交易日历；
-* ``universe_panel``：指数股票池时按日期的历史成员面板。
-
-训练是一次性的，模型包可显式保存为 joblib。推理函数仅使用冻结模型，输出
-``date | instrument | svm_score``；分数越高表示越靠近训练标签中的 +1 类。
+本模块不包含回测或交易逻辑。训练函数和流式推理函数均会通过 BigQuant
+loader 自动读取模型包 ``feature_spec`` 所声明的基础因子；调用方不需要准备
+``feature_panel``。训练标签所需的开盘价、交易日历和指数动态股票池也由训练/
+推理入口按需读取。训练是一次性的，模型包可显式保存为 joblib；推理输出
+``date | instrument | svm_score``，分数越高表示越靠近训练标签中的 +1 类。
 """
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import math
@@ -1084,6 +1081,10 @@ def _resolve_svm_dependencies(params):
         params.get("model_bundle"), params.get("model_artifact_dir")
     )
     return {
+        # 当前 SVM 在每个目标日只使用当日的一个特征截面；各基础因子
+        # 自己的 lookback 由 loader 根据其 data_window 独立预热。
+        # loader 的复合因子协议要求显式声明该序列长度。
+        "sequence_length": 1,
         "items": [
             {
                 "factor_name": item["factor_name"],
@@ -1224,8 +1225,38 @@ def _load_training_calendar_with_preheat(train_start, anchor, feature_spec):
     )
 
 
-def _load_training_feature_panel(feature_spec, target_dates, calendar, instruments, show_progress, batch_signal_dates=12):
-    """自动读取原始数据并分批计算基础因子，避免一次大查询耗尽平台内存。"""
+def _select_feature_input_dates(raw_dates, target_dates, data_window):
+    """按基础因子元数据声明的采样策略准备原始输入日期。"""
+    dates = _normalize_dates(raw_dates, "raw_dates")
+    targets = _normalize_dates(target_dates, "target_dates")
+    if not isinstance(data_window, Mapping):
+        raise TypeError("data_window 必须是字典。")
+    policy = data_window.get("input_date_sampling", "all_trading_days")
+    if policy == "all_trading_days":
+        return dates
+    if policy == "month_end_plus_target_dates":
+        series = pd.Series(dates)
+        month_ends = pd.DatetimeIndex(
+            series.groupby(series.dt.to_period("M"), sort=True).max().to_numpy()
+        )
+        return month_ends.union(targets).sort_values()
+    raise ValueError(
+        "未知 input_date_sampling："
+        f"{policy!r}。因子 data_window 只能声明 "
+        "'all_trading_days' 或 'month_end_plus_target_dates'。"
+    )
+
+
+def _load_training_feature_panel(
+    feature_spec,
+    target_dates,
+    calendar,
+    instruments,
+    show_progress,
+    batch_signal_dates=12,
+    progress_stage="训练特征读取与计算",
+):
+    """逐因子、逐日期块读取并计算特征，避免同时保留十份原始全 A 面板。"""
     from factor_lib.common.data_adapters.bigquant_adapters.loader import (
         get_factor_data_requirements,
         load_factor_raw_data,
@@ -1256,16 +1287,24 @@ def _load_training_feature_panel(feature_spec, target_dates, calendar, instrumen
             first = positions[chunk_dates.min()]
             last = positions[chunk_dates.max()]
             raw_dates = calendar[max(0, first - lookback): last + 1]
+            input_dates = _select_feature_input_dates(
+                raw_dates,
+                chunk_dates,
+                window,
+            )
             if show_progress:
                 _render_progress(
-                    "训练特征读取与计算",
+                    progress_stage,
                     feature_position - 1,
                     len(feature_spec),
                     started,
-                    f"{item['feature_name']}，分块 {chunk_position}/{len(chunks)}，预热 {lookback} 日",
+                    (
+                        f"{item['feature_name']}，分块 {chunk_position}/{len(chunks)}，"
+                        f"预热 {lookback} 日，读取 {len(input_dates)} 个日期"
+                    ),
                 )
             raw_data = load_factor_raw_data(
-                item["factor_name"], dates=raw_dates,
+                item["factor_name"], dates=input_dates,
                 factor_params=requirements["resolved_factor_params"],
                 instruments=instruments, show_progress=show_progress,
             )
@@ -1274,15 +1313,20 @@ def _load_training_feature_panel(feature_spec, target_dates, calendar, instrumen
                 as_of_date=chunk_dates.max(), show_progress=show_progress,
                 progress_every=1, **item["params"],
             )
-            parts.append(values.loc[:, ["date", "instrument", value_column]])
+            # 只保留当前目标截面的单列因子值。raw_data 往往是数百万行全 A
+            # 原始面板，必须在每个子因子/分块结束后立刻解除引用并回收。
+            parts.append(
+                values.loc[:, ["date", "instrument", value_column]].copy()
+            )
             del raw_data, values
+            gc.collect()
         if not parts:
             raise RuntimeError(f"训练特征 {item['feature_name']!r} 未产生任何分块结果。")
         piece = pd.concat(parts, ignore_index=True).rename(columns={value_column: item["feature_name"]})
         piece["date"] = pd.to_datetime(piece["date"]).dt.normalize()
         pieces.append(piece)
         if show_progress:
-            _render_progress("训练特征读取与计算", feature_position, len(feature_spec), started, f"{item['feature_name']} 完成")
+            _render_progress(progress_stage, feature_position, len(feature_spec), started, f"{item['feature_name']} 完成")
     if show_progress:
         print()
     panel = pieces[0]
@@ -1363,6 +1407,145 @@ def train_svm_model(
     return bundle
 
 
+def infer_svm_score(
+    *,
+    target_dates,
+    model_bundle=None,
+    model_artifact_dir=None,
+    universe=None,
+    universe_panel=None,
+    as_of_date=None,
+    batch_signal_dates=2,
+    show_progress=True,
+    progress_every=20,
+):
+    """以受控内存计算冻结 SVM 的目标日截面评分。
+
+    本函数是大股票池研究/评价的推荐推理入口。它仍完全依据模型包中的
+    ``feature_spec`` 自动读取并计算基础因子，但不会让 loader 同时持有全部
+    依赖因子的原始面板：每次只处理 ``batch_signal_dates`` 个信号日，并按特征
+    顺序读取、计算、保留一列结果后立即释放原始数据。
+
+    ``calc_svm_score`` 仍是因子中心通过依赖容器调用的标准入口；当目标日跨度
+    较长且股票池为全 A 时，应使用本函数避免依赖容器积累十份大面板。
+    """
+    if (
+        not isinstance(batch_signal_dates, (int, np.integer))
+        or isinstance(batch_signal_dates, bool)
+        or batch_signal_dates <= 0
+    ):
+        raise ValueError("batch_signal_dates 必须是正整数。")
+
+    bundle = _load_model_for_runtime(model_bundle, model_artifact_dir)
+    targets = _normalize_dates(target_dates, "target_dates")
+    cutoff = targets.max() if as_of_date is None else _as_date(as_of_date, "as_of_date")
+    if (targets > cutoff).any():
+        raise ValueError("target_dates 不得晚于 as_of_date。")
+
+    effective_universe = (
+        bundle["training_universe_config"] if universe is None else universe
+    )
+    normalized_universe = _normalize_universe(effective_universe)
+    calendar, required_preheat = _load_training_calendar_with_preheat(
+        targets.min(), cutoff, bundle["feature_spec"]
+    )
+    missing_calendar_dates = targets.difference(calendar)
+    if not missing_calendar_dates.empty:
+        raise ValueError(
+            "以下 target_dates 不在交易日历中："
+            f"{[str(date.date()) for date in missing_calendar_dates[:5]]}"
+        )
+
+    if normalized_universe["type"] == "index":
+        if universe_panel is None:
+            _, effective_universe_panel, load_instruments = _resolve_training_universe(
+                normalized_universe, targets
+            )
+        else:
+            effective_universe_panel = universe_panel.copy()
+            required_columns = {"date", "instrument"}
+            missing_columns = required_columns - set(effective_universe_panel.columns)
+            if missing_columns:
+                raise ValueError(
+                    "universe_panel 缺少字段："
+                    f"{sorted(missing_columns)}"
+                )
+            effective_universe_panel["date"] = pd.to_datetime(
+                effective_universe_panel["date"], errors="raise"
+            ).dt.normalize()
+            effective_universe_panel = effective_universe_panel.loc[
+                effective_universe_panel["date"].isin(targets),
+                ["date", "instrument"],
+            ].drop_duplicates()
+            load_instruments = sorted(
+                effective_universe_panel["instrument"].astype(str).unique().tolist()
+            )
+    else:
+        _, effective_universe_panel, load_instruments = _resolve_training_universe(
+            normalized_universe, targets
+        )
+
+    chunks = [
+        targets[start: start + int(batch_signal_dates)]
+        for start in range(0, len(targets), int(batch_signal_dates))
+    ]
+    started = time.perf_counter()
+    result_parts = []
+    for chunk_position, chunk_dates in enumerate(chunks, start=1):
+        if show_progress:
+            _render_progress(
+                "流式固定模型推理",
+                chunk_position - 1,
+                len(chunks),
+                started,
+                (
+                    f"分块 {chunk_position}/{len(chunks)}，"
+                    f"{chunk_dates.min():%Y-%m-%d} 至 {chunk_dates.max():%Y-%m-%d}，"
+                    f"最长预热 {required_preheat} 日"
+                ),
+            )
+        feature_panel = _load_training_feature_panel(
+            bundle["feature_spec"],
+            chunk_dates,
+            calendar,
+            load_instruments,
+            show_progress,
+            batch_signal_dates=len(chunk_dates),
+            progress_stage="流式推理特征读取与计算",
+        )
+        scores = _score_svm_from_panel(
+            feature_panel,
+            target_dates=chunk_dates,
+            as_of_date=cutoff,
+            universe=normalized_universe,
+            universe_panel=effective_universe_panel,
+            model_bundle=bundle,
+            show_progress=show_progress,
+            progress_every=progress_every,
+        )
+        result_parts.append(scores)
+        del feature_panel, scores
+        gc.collect()
+        if show_progress:
+            _render_progress(
+                "流式固定模型推理",
+                chunk_position,
+                len(chunks),
+                started,
+                f"分块 {chunk_position}/{len(chunks)} 已完成",
+            )
+    if show_progress:
+        print()
+    result = (
+        pd.concat(result_parts, ignore_index=True)
+        if result_parts
+        else pd.DataFrame(columns=OUTPUT_COLUMNS)
+    )
+    return result.sort_values(
+        ["date", "instrument"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
 def calc_svm_score(
     data, target_dates=None, as_of_date=None, *, model_bundle=None,
     model_artifact_dir=None, universe=None, universe_panel=None,
@@ -1396,11 +1579,14 @@ FACTOR = {
     "description": "固定模型支持向量机评分因子；分数越高越接近训练标签中的未来超额收益高组。",
     "formula": "svm_score 是冻结 SVM 对经过同一预处理的特征向量输出的、朝 +1 类方向的决策边界 margin。",
     "input_schema": {
+        # SVM 的十个基础因子由 dependencies.resolver 统一声明和加载；
+        # 这里仅保留根面板的主键，不能把 dependency_data 伪字段放入
+        # conditional，否则 loader 会误将其路由为某个原始数据字段。
         "required": {
             "date": {"dtype": "datetime64[ns]", "frequency": "daily", "meaning": "目标因子截面日期。"},
             "instrument": {"dtype": "string", "frequency": "daily", "meaning": "证券唯一标识。"},
         },
-        "conditional": {"dependency_data": {"meaning": "由 model_bundle.feature_spec 的 dependencies 自动预存和计算。"}},
+        "conditional": {},
     },
     "parameters": {
         "target_dates": {"default": None, "accepted_values": "日期或日期序列", "effect": "指定输出截面。", "changes_data_requirements": False},

@@ -63,6 +63,10 @@ def _resolve_data_window(params):
         "requires_target_date_data": True,
         "minimum_history_observations": 0,
         "preheating_required": True,
+        # 本因子只以每个自然月最后一个交易日构造月收益、SMB 和 HML；
+        # 目标日自身仍须保留，用于输出该日股票的因子值。该声明由通用
+        # SVM 自动特征读取器解释，不应由下游按因子名称编写特例。
+        "input_date_sampling": "month_end_plus_target_dates",
         "insufficient_window_behavior": (
             "不设置人为最低观测门槛；仅在三因子回归数学上不可定义时输出NaN。"
         ),

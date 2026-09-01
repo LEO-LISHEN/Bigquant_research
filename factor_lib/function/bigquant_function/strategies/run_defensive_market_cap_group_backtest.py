@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """BigQuant N 日频市值分组因子分位等权回测。
 
-公开接口只有 ``run_market_cap_group_backtest``。策略负责：
+公开接口只有 ``run_defensive_market_cap_group_backtest``。策略负责：
 
 1. 根据交易日历构造信号日、执行日和因子预热日期；
 2. 通过 BigQuant 数据适配器一次性预存原始数据；
@@ -13,7 +13,7 @@
 默认显式输出仅为 ``M.bigtrader.v35`` 生成的 BigQuant 回测图表。
 """
 
-# 对外仅使用文件底部的 run_market_cap_group_backtest()。
+# 对外仅使用文件底部的 run_defensive_market_cap_group_backtest()。
 
 from __future__ import annotations
 
@@ -182,6 +182,76 @@ def _normalize_instruments(values):
     if not normalized:
         raise ValueError("自定义股票集合不能为空。")
     return normalized
+
+
+def _normalize_defensive_config(
+    defensive_benchmark_index,
+    defensive_ma_window,
+    defensive_strategy_weight,
+    defensive_compensation_instruments,
+    market_index_code_mapping,
+):
+    """校验防御开关，并把指数代码统一解析成市场适配器别名。"""
+    supplied_values = (
+        defensive_benchmark_index,
+        defensive_ma_window,
+        defensive_strategy_weight,
+        defensive_compensation_instruments,
+    )
+    if all(value is None for value in supplied_values):
+        return None
+    if any(value is None for value in supplied_values):
+        raise ValueError(
+            "启用防御配置时，defensive_benchmark_index、"
+            "defensive_ma_window、defensive_strategy_weight 和 "
+            "defensive_compensation_instruments 必须同时传入。"
+        )
+
+    if not isinstance(defensive_benchmark_index, str):
+        raise TypeError("defensive_benchmark_index 必须是指数别名或指数代码字符串。")
+    requested_index = defensive_benchmark_index.strip()
+    if not requested_index:
+        raise ValueError("defensive_benchmark_index 不能为空。")
+
+    normalized_mapping = {
+        str(name).strip().lower(): str(code).strip()
+        for name, code in market_index_code_mapping.items()
+    }
+    code_to_name = {
+        code.upper(): name
+        for name, code in normalized_mapping.items()
+    }
+    market_index = normalized_mapping.get(requested_index.lower())
+    if market_index is None:
+        market_index = code_to_name.get(requested_index.upper())
+    if market_index is None:
+        supported = sorted(normalized_mapping)
+        raise ValueError(
+            "defensive_benchmark_index 不受市场数据适配器支持："
+            f"{requested_index!r}。可传指数别名 {supported}，"
+            "或其对应指数代码。"
+        )
+
+    ma_window = _normalize_positive_integer(
+        defensive_ma_window,
+        "defensive_ma_window",
+    )
+    strategy_weight = float(defensive_strategy_weight)
+    if not np.isfinite(strategy_weight) or not 0 <= strategy_weight <= 1:
+        raise ValueError(
+            "defensive_strategy_weight 必须是 0 至 1 之间的仓位小数，"
+            "例如 0.6 表示保留 60% 原策略仓位。"
+        )
+
+    return {
+        "market_index": market_index,
+        "market_index_code": normalized_mapping[market_index],
+        "ma_window": ma_window,
+        "strategy_weight": strategy_weight,
+        "compensation_instruments": _normalize_instruments(
+            defensive_compensation_instruments
+        ),
+    }
 
 
 def _normalize_universe(universe):
@@ -962,7 +1032,7 @@ def _run_with_stage_heartbeat(
         worker.join(timeout=max(interval_seconds, 0.1))
 
 
-def run_market_cap_group_backtest(
+def run_defensive_market_cap_group_backtest(
     start_date,
     end_date,
     rebalance_interval,
@@ -973,6 +1043,10 @@ def run_market_cap_group_backtest(
     factor_quantile_range=(0.0, 0.1),
     factor_params=None,
     factor_panel_provider=None,
+    defensive_benchmark_index=None,
+    defensive_ma_window=None,
+    defensive_strategy_weight=None,
+    defensive_compensation_instruments=None,
     order_price_field_buy="open",
     order_price_field_sell="open",
     initial_cash=1_000_000,
@@ -1017,6 +1091,19 @@ def run_market_cap_group_backtest(
         ``date``、``instrument`` 与因子输出列的 DataFrame。传入后，策略
         不再批量预存该因子的原始依赖数据，适用于需按信号日流式推理的
         机器学习因子；市值分组、选股、交易约束和 BigTrader 流程不变。
+    defensive_benchmark_index : str 或 None
+        防御开关监控的市场指数，可传市场适配器指数别名（如 ``csi_300``）
+        或对应指数代码（如 ``000300.SH``）。四个 defensive 参数都为 None
+        时，完全沿用原始市值分组策略。
+    defensive_ma_window : int 或 None
+        防御均线的交易日窗口；例如 23 表示使用信号日当日及此前 22 个
+        交易日收盘价计算 MA23。
+    defensive_strategy_weight : float 或 None
+        当指数收盘价低于 MA 时保留给原市值分组组合的目标仓位，取值 0 至 1。
+        未分配部分等权配置给 defensive_compensation_instruments。
+    defensive_compensation_instruments : sequence[str] 或 None
+        防御触发时用于承接降下仓位的自定义股票代码列表，列表内股票等权。
+        不设置具体股票的默认值，必须由调用方显式传入。
     order_price_field_buy, order_price_field_sell : str
         BigTrader Bar 撮合买卖参考价，支持 open、close、vwap。
     initial_cash : float
@@ -1112,12 +1199,26 @@ def run_market_cap_group_backtest(
     from factor_lib.common.data_adapters.bigquant_adapters.daily import (
         load_daily_raw_data,
     )
+    from factor_lib.common.data_adapters.bigquant_adapters.market_daily import (
+        MARKET_INDEX_CODE_MAPPING,
+        load_market_daily_raw_data,
+    )
     from factor_lib.common.data_adapters.bigquant_adapters.loader import (
         get_factor_data_requirements,
         get_factor_metadata,
         load_factor_raw_data,
     )
     from factor_lib.factor_hub.get_factor import get_factor
+
+    defensive_config = _normalize_defensive_config(
+        defensive_benchmark_index=defensive_benchmark_index,
+        defensive_ma_window=defensive_ma_window,
+        defensive_strategy_weight=defensive_strategy_weight,
+        defensive_compensation_instruments=(
+            defensive_compensation_instruments
+        ),
+        market_index_code_mapping=MARKET_INDEX_CODE_MAPPING,
+    )
 
     if show_progress:
         _render_progress(
@@ -1141,6 +1242,118 @@ def run_market_cap_group_backtest(
     )
     signal_dates = pd.DatetimeIndex(schedule["signal_date"])
     execution_dates = pd.DatetimeIndex(schedule["execution_date"])
+
+    defensive_signal_by_date = None
+    if defensive_config is not None:
+        calendar_positions = {
+            date: position
+            for position, date in enumerate(trading_calendar)
+        }
+        first_signal_date = signal_dates.min()
+        first_signal_position = calendar_positions.get(first_signal_date)
+        if first_signal_position is None:
+            raise ValueError("交易日历中缺少首个防御信号日。")
+        required_history = defensive_config["ma_window"] - 1
+        if first_signal_position < required_history:
+            raise ValueError(
+                "首个信号日前的交易日不足以计算防御均线："
+                f"需要 MA{defensive_config['ma_window']} 的完整历史窗口。"
+            )
+
+        defensive_data_start = trading_calendar[
+            first_signal_position - required_history
+        ]
+        if show_progress:
+            _render_progress(
+                1,
+                8,
+                "读取防御基准并计算信号日均线",
+                started_at,
+                completed=0,
+                total=1,
+                current=defensive_config["market_index_code"],
+                detail=(
+                    f"MA{defensive_config['ma_window']}，"
+                    f"{defensive_data_start:%Y-%m-%d} 至 "
+                    f"{signal_dates.max():%Y-%m-%d}"
+                ),
+            )
+        defensive_market_panel = load_market_daily_raw_data(
+            standard_fields=["market_close"],
+            market_index=defensive_config["market_index"],
+            start_date=defensive_data_start,
+            end_date=signal_dates.max(),
+            show_progress=show_progress,
+        )
+        defensive_market_panel = _validate_panel(
+            defensive_market_panel,
+            "defensive_market_panel",
+            ["date", "market_index", "market_close"],
+        )
+        defensive_market_panel = defensive_market_panel.loc[
+            defensive_market_panel["market_index"]
+            == defensive_config["market_index"],
+            ["date", "market_close"],
+        ].copy()
+        defensive_market_panel["market_close"] = pd.to_numeric(
+            defensive_market_panel["market_close"],
+            errors="coerce",
+        )
+        if defensive_market_panel["market_close"].isna().any():
+            raise ValueError("防御基准收盘价存在缺失或非数值数据。")
+        defensive_market_panel = defensive_market_panel.drop_duplicates(
+            subset=["date"],
+            keep=False,
+        ).set_index("date")
+        defensive_dates = trading_calendar[
+            (trading_calendar >= defensive_data_start)
+            & (trading_calendar <= signal_dates.max())
+        ]
+        defensive_close = defensive_market_panel["market_close"].reindex(
+            defensive_dates
+        )
+        if defensive_close.isna().any():
+            missing_dates = defensive_close.index[defensive_close.isna()]
+            raise ValueError(
+                "防御基准缺少交易日收盘价："
+                f"{[date.strftime('%Y-%m-%d') for date in missing_dates[:5]]}"
+            )
+        defensive_ma = defensive_close.rolling(
+            window=defensive_config["ma_window"],
+            min_periods=defensive_config["ma_window"],
+        ).mean()
+        defensive_frame = pd.DataFrame(
+            {
+                "market_close": defensive_close.reindex(signal_dates),
+                "market_ma": defensive_ma.reindex(signal_dates),
+            },
+            index=signal_dates,
+        )
+        if defensive_frame.isna().any(axis=None):
+            raise ValueError("防御信号日未能计算完整的基准均线。")
+        defensive_signal_by_date = {
+            row.Index: {
+                "is_defensive": bool(
+                    row.market_close < row.market_ma
+                ),
+                "market_close": float(row.market_close),
+                "market_ma": float(row.market_ma),
+            }
+            for row in defensive_frame.itertuples()
+        }
+        if show_progress:
+            _render_progress(
+                1,
+                8,
+                "防御信号准备完成",
+                started_at,
+                completed=1,
+                total=1,
+                detail=(
+                    f"触发{sum(item['is_defensive'] for item in defensive_signal_by_date.values())}"
+                    f"/{len(defensive_signal_by_date)}个信号日"
+                ),
+            )
     if show_progress:
         _render_progress(
             1,
@@ -1161,6 +1374,14 @@ def run_market_cap_group_backtest(
         show_progress=show_progress,
         started_at=started_at,
     )
+    if defensive_config is not None and load_instruments is not None:
+        # 自定义/指数股票池需要额外读取补偿股票的信号日、执行日状态；
+        # 不把它们并入 universe_panel，因此因子选股范围完全不变。
+        load_instruments = sorted(
+            set(load_instruments).union(
+                defensive_config["compensation_instruments"]
+            )
+        )
 
     if factor_panel_provider is None:
         requirements = get_factor_data_requirements(
@@ -1464,6 +1685,7 @@ def run_market_cap_group_backtest(
     trade_records = []
     completed_signal_count = 0
     successful_signal_count = 0
+    defensive_rebalance_count = 0
     if show_progress:
         _render_progress(
             6,
@@ -1498,7 +1720,9 @@ def run_market_cap_group_backtest(
             )
 
     def handle_data(context, data):
-        nonlocal completed_signal_count, successful_signal_count
+        nonlocal completed_signal_count
+        nonlocal successful_signal_count
+        nonlocal defensive_rebalance_count
 
         signal_date = pd.Timestamp(data.current_dt).normalize()
         schedule_item = schedule_by_signal.get(signal_date)
@@ -1525,6 +1749,20 @@ def run_market_cap_group_backtest(
                 detail=f"第{rebalance_number}次调仓",
             )
 
+        defensive_state = (
+            defensive_signal_by_date.get(signal_date)
+            if defensive_signal_by_date is not None
+            else None
+        )
+        defensive_active = bool(
+            defensive_state is not None
+            and defensive_state["is_defensive"]
+        )
+        # 将“本次确已触发防御”收窄为非空配置，既表达运行时前置条件，
+        # 也避免静态检查器把 defensive_config 误判为 Optional。
+        active_defensive_config = (
+            defensive_config if defensive_active else None
+        )
         try:
             if provided_factor_by_date is None:
                 # 该分支仅由原始批量加载路径进入；断言同时为静态检查器
@@ -1599,6 +1837,13 @@ def run_market_cap_group_backtest(
                 quantile_lower=quantile_lower,
                 quantile_upper=quantile_upper,
             )
+            if active_defensive_config is not None and not selected.empty:
+                # 原选股总权重由 100% 缩放至 defensive_strategy_weight；
+                # 未分配部分随后才等权转入调用方指定的补偿股票。
+                selected = selected.copy()
+                selected["target_weight"] *= active_defensive_config[
+                    "strategy_weight"
+                ]
             successful_signal_count += 1
             status = "ok" if not selected.empty else "empty_target"
             error_message = ""
@@ -1614,6 +1859,8 @@ def run_market_cap_group_backtest(
             }
             status = "skipped_error"
             error_message = f"{type(exc).__name__}: {exc}"
+            defensive_active = False
+            active_defensive_config = None
 
         rebalance_records.append(
             {
@@ -1671,6 +1918,17 @@ def run_market_cap_group_backtest(
                     selected["target_weight"],
                 )
             )
+
+        if active_defensive_config is not None:
+            defensive_rebalance_count += 1
+            compensation_weight = (
+                1.0 - active_defensive_config["strategy_weight"]
+            ) / len(active_defensive_config["compensation_instruments"])
+            for instrument in active_defensive_config["compensation_instruments"]:
+                target_weights[instrument] = (
+                    float(target_weights.get(instrument, 0.0))
+                    + compensation_weight
+                )
 
         positions, current_weights = _current_position_weights(context)
         holding_instruments = {
@@ -1988,6 +2246,19 @@ def run_market_cap_group_backtest(
         "signal_state_rows": len(signal_panel),
         "execution_state_rows": len(execution_panel),
         "engine_instrument_count": len(engine_instruments),
+        "defensive_config": (
+            {
+                "benchmark_index": defensive_config["market_index_code"],
+                "ma_window": defensive_config["ma_window"],
+                "strategy_weight": defensive_config["strategy_weight"],
+                "compensation_instruments": list(
+                    defensive_config["compensation_instruments"]
+                ),
+            }
+            if defensive_config is not None
+            else None
+        ),
+        "defensive_rebalance_count": defensive_rebalance_count,
         "scheduled_rebalance_count": len(schedule),
         "processed_signal_count": completed_signal_count,
         "successful_signal_count": successful_signal_count,
