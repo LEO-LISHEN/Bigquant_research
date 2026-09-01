@@ -27,6 +27,7 @@ MARKET_INDEX_CODE_MAPPING = {
     "csi_300": "000300.SH",
     "csi_500": "000905.SH",
     "csi_1000": "000852.SH",
+    "csi_2000": "932000.CSI",
     "sse_composite": "000001.SH",
     "szse_component": "399001.SZ",
     "chinext": "399006.SZ",
