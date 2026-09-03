@@ -1,0 +1,96 @@
+{
+  "周期再平衡间隔": 55,
+  "静态资金锚": {
+    "cluster_1_defensive_small": 0.5551990309911414,
+    "cluster_2_value_growth": 0.15146335020995633,
+    "cluster_3_large_quality": 0.14117397092985334,
+    "cluster_4_fast_moneyflow": 0.15216364786904896
+  },
+  "四簇配置": {
+    "cluster_1_defensive_small": {
+      "display_name": "防御型小市值综合因子",
+      "factor_weights": {
+        "hml_r_std_5m": 0.4428565664095614,
+        "exp_wgt_return_6m": 0.3658436911910037,
+        "bias_std_turn_5d": 0.19129974239943487
+      },
+      "market_cap_groups": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "select_pct": 0.05,
+      "rebalance_days": 25,
+      "capital_weight": 0.5551990309911414,
+      "normal_factor_exposure": 0.98,
+      "use_defensive_compensation": true,
+      "trend_index": "000852.SH",
+      "trend_ma_window": 40,
+      "risk_on_factor_exposure": 0.98,
+      "risk_off_factor_exposure": 0.1,
+      "risk_off_defensive_exposure": 0.88,
+      "defensive_assets": [
+        "601398.SH",
+        "601328.SH",
+        "601988.SH"
+      ]
+    },
+    "cluster_2_value_growth": {
+      "display_name": "价值成长综合因子",
+      "factor_weights": {
+        "BP": 0.1791659022650231,
+        "Profit_G_q": 0.820834097734977
+      },
+      "market_cap_groups": [
+        1
+      ],
+      "select_pct": 0.2,
+      "rebalance_days": 20,
+      "capital_weight": 0.15146335020995633,
+      "normal_factor_exposure": 0.98,
+      "use_defensive_compensation": false
+    },
+    "cluster_3_large_quality": {
+      "display_name": "大市值财务质量",
+      "factor_weights": {
+        "qfa_roe": 1.0
+      },
+      "market_cap_groups": [
+        13,
+        14,
+        15
+      ],
+      "select_pct": 0.075,
+      "rebalance_days": 20,
+      "capital_weight": 0.14117397092985334,
+      "normal_factor_exposure": 0.98,
+      "use_defensive_compensation": true,
+      "trend_index": "000300.SH",
+      "trend_ma_window": 40,
+      "risk_on_factor_exposure": 0.98,
+      "risk_off_factor_exposure": 0.0,
+      "risk_off_defensive_exposure": 0.98,
+      "defensive_assets": [
+        "601398.SH",
+        "601328.SH",
+        "601988.SH"
+      ]
+    },
+    "cluster_4_fast_moneyflow": {
+      "display_name": "快速资金流向",
+      "factor_weights": {
+        "mfd_sellamt_d_sum_10": 1.0
+      },
+      "market_cap_groups": [
+        1,
+        2
+      ],
+      "select_pct": 0.15,
+      "rebalance_days": 3,
+      "capital_weight": 0.15216364786904896,
+      "normal_factor_exposure": 0.98,
+      "use_defensive_compensation": false
+    }
+  }
+}

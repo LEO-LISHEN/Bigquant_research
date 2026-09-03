@@ -1,0 +1,52 @@
+{
+  "created_at": "2026-08-31T21:02:43",
+  "config": {
+    "evaluation_start_date": "2017-01-03",
+    "evaluation_end_date": "2024-12-31",
+    "information_anchor_date": "2025-02-14",
+    "trading_calendar_start_date": "2010-01-01",
+    "signal_interval_trading_days": 20,
+    "prediction_label_window_trading_days": 20,
+    "factor_batch_signal_dates": 12,
+    "minimum_signal_dates": 80,
+    "min_obs": 30,
+    "universe": {
+      "type": "all_a"
+    },
+    "plot_top_n": 6,
+    "output_directory_name": "svm_feature_screening_latest"
+  },
+  "effective_information_anchor_date": "2025-02-14 00:00:00",
+  "signal_date_count": 98,
+  "feature_count": 73,
+  "feature_panel_row_count": 418175,
+  "label_row_count": 418175,
+  "default_instance_fallback_factors": [
+    "earnings_to_price_deducted",
+    "gross_profit_margin_q",
+    "gross_profit_margin_ttm",
+    "growth_to_pe",
+    "net_profit_margin_q",
+    "net_profit_margin_ttm",
+    "operating_cashflow_growth_q",
+    "operating_cashflow_to_parent_net_profit_q",
+    "operating_cashflow_to_parent_net_profit_ttm",
+    "roa_avg_q",
+    "roa_avg_ttm",
+    "roe_avg_ttm",
+    "roe_growth_q",
+    "total_assets_turnover_q",
+    "total_assets_turnover_ttm"
+  ],
+  "files": [
+    "factor_plan.parquet",
+    "factor_metrics_summary.parquet",
+    "factor_correlation_spearman.parquet",
+    "factor_correlation_overlap_days.parquet",
+    "factor_metric_timeseries.parquet",
+    "feature_panel.parquet",
+    "label_data.parquet",
+    "universe_panel.parquet",
+    "run_metadata.json"
+  ]
+}

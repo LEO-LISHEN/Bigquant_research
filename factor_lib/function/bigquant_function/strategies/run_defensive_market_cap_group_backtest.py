@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""BigQuant N 日频市值分组因子分位等权回测。
+"""BigQuant 市值分组因子回测：20日更新因子组合，日频 MA 防御切换。
 
 公开接口只有 ``run_defensive_market_cap_group_backtest``。策略负责：
 
@@ -8,12 +8,13 @@
 3. 在每个信号日动态调用因子函数计算单日截面；
 4. 在各市值组内按原始因子值分位区间独立选股；
 5. 使用 BigTrader 在下一交易日按指定价格等权调仓；
-6. 保留信号、调仓、订单和成交审计对象，但默认不打印它们。
+6. 每日收盘后检查防御均线，并在下一交易日开盘执行必要的风险切换；
+7. 保留信号、日频防御、订单和成交审计对象，但默认不打印它们。
 
 默认显式输出仅为 ``M.bigtrader.v35`` 生成的 BigQuant 回测图表。
 """
 
-# 对外仅使用文件底部的 run_defensive_market_cap_group_backtest()。
+# 对外仅使用 run_defensive_market_cap_group_backtest()。
 
 from __future__ import annotations
 
@@ -221,10 +222,10 @@ def _normalize_defensive_config(
         code.upper(): name
         for name, code in normalized_mapping.items()
     }
-    market_index = normalized_mapping.get(requested_index.lower())
-    if market_index is None:
-        market_index = code_to_name.get(requested_index.upper())
-    if market_index is None:
+    market_index_name = requested_index.lower()
+    if market_index_name not in normalized_mapping:
+        market_index_name = code_to_name.get(requested_index.upper())
+    if market_index_name is None:
         supported = sorted(normalized_mapping)
         raise ValueError(
             "defensive_benchmark_index 不受市场数据适配器支持："
@@ -244,8 +245,8 @@ def _normalize_defensive_config(
         )
 
     return {
-        "market_index": market_index,
-        "market_index_code": normalized_mapping[market_index],
+        "market_index": market_index_name,
+        "market_index_code": normalized_mapping[market_index_name],
         "ma_window": ma_window,
         "strategy_weight": strategy_weight,
         "compensation_instruments": _normalize_instruments(
@@ -557,13 +558,36 @@ def _build_universe_panel(
     raise RuntimeError(f"未处理的股票池类型：{universe_type}")
 
 
-def _validate_panel(panel, panel_name, required_columns):
+def _validate_panel(
+    panel,
+    panel_name,
+    required_columns,
+    *,
+    key_columns=None,
+):
+    """校验通用数据面板，并按其自身主键检查空值与重复。
+
+    股票日频面板的主键是 ``date + instrument``；市场指数面板没有
+    ``instrument``，其主键则是 ``date + market_index``。不能把两类面板
+    混用同一套股票主键校验。
+    """
     if not isinstance(panel, pd.DataFrame):
         raise TypeError(f"{panel_name} 必须是 pandas.DataFrame。")
     missing = set(required_columns) - set(panel.columns)
     if missing:
         raise ValueError(
             f"{panel_name} 缺少字段：{sorted(missing)}"
+        )
+
+    if key_columns is None:
+        key_columns = _DATE_KEY_COLUMNS
+    key_columns = list(key_columns)
+    if not key_columns or key_columns[0] != "date":
+        raise ValueError(f"{panel_name} 的 key_columns 必须以 'date' 开头。")
+    missing_key_columns = set(key_columns) - set(panel.columns)
+    if missing_key_columns:
+        raise ValueError(
+            f"{panel_name} 的主键字段缺失：{sorted(missing_key_columns)}"
         )
 
     result = panel.copy()
@@ -573,19 +597,20 @@ def _validate_panel(panel, panel_name, required_columns):
     ).dt.normalize()
     if result["date"].isna().any():
         raise ValueError(f"{panel_name} 中存在无效日期。")
-    if result["instrument"].isna().any():
-        raise ValueError(f"{panel_name} 中存在空 instrument。")
+    for column in key_columns[1:]:
+        if result[column].isna().any():
+            raise ValueError(f"{panel_name} 中存在空主键字段 {column!r}。")
 
-    duplicated = result.duplicated(_DATE_KEY_COLUMNS, keep=False)
+    duplicated = result.duplicated(key_columns, keep=False)
     if duplicated.any():
         examples = (
-            result.loc[duplicated, _DATE_KEY_COLUMNS]
+            result.loc[duplicated, key_columns]
             .head(5)
             .astype(str)
             .to_dict("records")
         )
         raise ValueError(
-            f"{panel_name} 中存在重复 date + instrument：{examples}"
+            f"{panel_name} 中存在重复主键 {key_columns}：{examples}"
         )
     return result
 
@@ -1032,6 +1057,8 @@ def _run_with_stage_heartbeat(
         worker.join(timeout=max(interval_seconds, 0.1))
 
 
+
+
 def run_defensive_market_cap_group_backtest(
     start_date,
     end_date,
@@ -1055,111 +1082,32 @@ def run_defensive_market_cap_group_backtest(
     slippage_value=None,
     volume_limit=0.025,
     weight_tolerance=1e-4,
-    show_progress=False,
-    progress_every=20,
+    show_progress=True,
+    progress_every=1,
 ):
-    """运行 BigQuant N 日频市值分组因子分位等权回测。
+    """20日更新因子组合，并以日频 MA 信号在下一开盘切换风险仓位。
 
-    参数
-    ----
-    start_date, end_date : str 或 datetime
-        回测日期范围。回测区间内第一个交易日是首次执行日；若 start_date
-        不是交易日，则顺延至下一个交易日。
-    rebalance_interval : int
-        调仓间隔，按交易日间隔计算。首次执行日下标为 0，之后为
-        0、N、2N、3N……
-    universe : str、sequence[str] 或 dict
-        ``"all_a"`` 表示全部 A 股；
-        ``{"type": "index", "index_codes": [...]}`` 表示一个或多个指数的
-        历史成分股并集；
-        ``{"type": "custom", "instruments": [...]}`` 或代码集合表示固定
-        股票范围。
-    factor_name : str
-        因子中心中登记的 FACTOR 名称。
-    market_cap_group_count : int，默认 15
-        按信号日总市值从小到大划分的等数量组数；第 1 组市值最小。
-    selected_market_cap_groups : sequence[int] 或 None
-        参与选股的市值组；None 表示全部市值组。
-    factor_quantile_range : tuple[float, float]，默认 (0.0, 0.1)
-        每个市值组内部按原始因子值从小到大的位置区间。区间不根据
-        FACTOR['direction'] 自动翻转。
-    factor_params : dict 或 None
-        传给因子计算函数的内部参数。target_dates、as_of_date 和进度参数
-        由策略统一控制，不能在这里覆盖。
-    factor_panel_provider : callable 或 None
-        可选的因子面板提供器。接收本次全部 ``signal_dates``，返回包含
-        ``date``、``instrument`` 与因子输出列的 DataFrame。传入后，策略
-        不再批量预存该因子的原始依赖数据，适用于需按信号日流式推理的
-        机器学习因子；市值分组、选股、交易约束和 BigTrader 流程不变。
-    defensive_benchmark_index : str 或 None
-        防御开关监控的市场指数，可传市场适配器指数别名（如 ``csi_300``）
-        或对应指数代码（如 ``000300.SH``）。四个 defensive 参数都为 None
-        时，完全沿用原始市值分组策略。
-    defensive_ma_window : int 或 None
-        防御均线的交易日窗口；例如 23 表示使用信号日当日及此前 22 个
-        交易日收盘价计算 MA23。
-    defensive_strategy_weight : float 或 None
-        当指数收盘价低于 MA 时保留给原市值分组组合的目标仓位，取值 0 至 1。
-        未分配部分等权配置给 defensive_compensation_instruments。
-    defensive_compensation_instruments : sequence[str] 或 None
-        防御触发时用于承接降下仓位的自定义股票代码列表，列表内股票等权。
-        不设置具体股票的默认值，必须由调用方显式传入。
-    order_price_field_buy, order_price_field_sell : str
-        BigTrader Bar 撮合买卖参考价，支持 open、close、vwap。
-    initial_cash : float
-        初始资金。
-    benchmark : str 或 None
-        BigQuant 回测基准。
-    trading_costs : dict 或 None
-        至少包含 buy_cost、sell_cost、min_cost、tax_ratio。
-    slippage_value : float 或 None
-        百分比滑点；None 表示不覆盖平台默认滑点设置。
-    volume_limit : float
-        单个订单最多占执行 Bar 成交量的比例。
-    weight_tolerance : float
-        目标权重和估算当前权重差值不超过该值时不提交调整订单。
-    show_progress : bool
-        是否显示单行进度。默认 False，不打印表格或审计结果。
-    progress_every : int
-        每处理多少个信号日刷新一次进度。
-
-    返回
-    ----
-    dict
-        ``performance`` 是 BigTrader 原始回测对象；其余 schedule、
-        signals、rebalance_audit、execution_audit、order_audit、
-        trade_audit 和 data_diagnostics 默认只保存在返回对象中。
-
-    时序说明
-    --------
-    信号在执行日前一个交易日收盘后形成，因子调用固定使用
-    ``target_dates=[signal_date]`` 和 ``as_of_date=signal_date``。
-    BigTrader 在下一交易日按指定 Bar 价格撮合。执行日涨跌停、停牌、
-    ST 和成交量状态仅作为订单可成交约束，不参与前一日选股，也不会触发
-    替补股票或权重再分配。
+    信号日收盘价首次跌破均线时，下一交易日开盘将最近的因子组合缩放至
+    defensive_strategy_weight，并将余额等权配置到补偿股票。重新突破时，
+    下一开盘退出补偿股票并恢复最近一次因子目标组合。返回值新增
+    defensive_audit，逐日记录状态、切换原因和订单数量。
     """
     started_at = time.perf_counter()
-
     start_date = _normalize_timestamp(start_date, "start_date")
     end_date = _normalize_timestamp(end_date, "end_date")
-    if start_date > end_date:
-        raise ValueError("start_date 不能晚于 end_date。")
-
+    if end_date <= start_date:
+        raise ValueError("end_date 必须晚于 start_date。")
     rebalance_interval = _normalize_positive_integer(
-        rebalance_interval,
-        "rebalance_interval",
+        rebalance_interval, "rebalance_interval"
     )
     market_cap_group_count = _normalize_positive_integer(
-        market_cap_group_count,
-        "market_cap_group_count",
+        market_cap_group_count, "market_cap_group_count"
     )
     progress_every = _normalize_positive_integer(
-        progress_every,
-        "progress_every",
+        progress_every, "progress_every"
     )
     selected_groups = _normalize_selected_groups(
-        selected_market_cap_groups,
-        market_cap_group_count,
+        selected_market_cap_groups, market_cap_group_count
     )
     quantile_lower, quantile_upper = _normalize_quantile_range(
         factor_quantile_range
@@ -1169,19 +1117,15 @@ def run_defensive_market_cap_group_backtest(
         raise TypeError("factor_panel_provider 必须是可调用对象或 None。")
     universe_config = _normalize_universe(universe)
     buy_price_field = _normalize_price_field(
-        order_price_field_buy,
-        "order_price_field_buy",
+        order_price_field_buy, "order_price_field_buy"
     )
     sell_price_field = _normalize_price_field(
-        order_price_field_sell,
-        "order_price_field_sell",
+        order_price_field_sell, "order_price_field_sell"
     )
     trading_costs = _normalize_trading_costs(trading_costs)
-
     if not isinstance(factor_name, str) or not factor_name.strip():
         raise ValueError("factor_name 必须是非空字符串。")
     factor_name = factor_name.strip()
-
     initial_cash = float(initial_cash)
     if not np.isfinite(initial_cash) or initial_cash <= 0:
         raise ValueError("initial_cash 必须大于 0。")
@@ -1211,131 +1155,110 @@ def run_defensive_market_cap_group_backtest(
     from factor_lib.factor_hub.get_factor import get_factor
 
     defensive_config = _normalize_defensive_config(
-        defensive_benchmark_index=defensive_benchmark_index,
-        defensive_ma_window=defensive_ma_window,
-        defensive_strategy_weight=defensive_strategy_weight,
-        defensive_compensation_instruments=(
-            defensive_compensation_instruments
-        ),
-        market_index_code_mapping=MARKET_INDEX_CODE_MAPPING,
+        defensive_benchmark_index,
+        defensive_ma_window,
+        defensive_strategy_weight,
+        defensive_compensation_instruments,
+        MARKET_INDEX_CODE_MAPPING,
     )
-
     if show_progress:
         _render_progress(
-            1,
-            8,
-            "读取交易日历并生成调仓计划",
-            started_at,
+            1, 8, "读取交易日历并生成20日因子计划", started_at,
             current=f"{start_date:%Y-%m-%d} 至 {end_date:%Y-%m-%d}",
         )
-
     trading_calendar = _query_trading_calendar(
-        end_date,
-        show_progress=show_progress,
-        started_at=started_at,
+        end_date, show_progress=show_progress, started_at=started_at
     )
     schedule = _build_schedule(
-        trading_calendar=trading_calendar,
-        start_date=start_date,
-        end_date=end_date,
-        rebalance_interval=rebalance_interval,
+        trading_calendar, start_date, end_date, rebalance_interval
     )
     signal_dates = pd.DatetimeIndex(schedule["signal_date"])
-    execution_dates = pd.DatetimeIndex(schedule["execution_date"])
+    calendar_positions = {
+        date: position for position, date in enumerate(trading_calendar)
+    }
+    engine_start_date = signal_dates.min()
+    engine_start_position = calendar_positions[engine_start_date]
+    available_end_dates = trading_calendar[trading_calendar <= end_date]
+    if available_end_dates.empty:
+        raise ValueError("end_date 之前没有可用交易日。")
+    effective_end_date = available_end_dates[-1]
+    end_position = calendar_positions[effective_end_date]
+    decision_dates = trading_calendar[engine_start_position:end_position]
+    daily_execution_dates = trading_calendar[
+        engine_start_position + 1 : end_position + 1
+    ]
+    if decision_dates.empty or len(decision_dates) != len(daily_execution_dates):
+        raise ValueError("无法生成日频决策日与下一交易日执行日配对。")
+    decision_to_execution = dict(zip(decision_dates, daily_execution_dates))
 
     defensive_signal_by_date = None
     if defensive_config is not None:
-        calendar_positions = {
-            date: position
-            for position, date in enumerate(trading_calendar)
-        }
-        first_signal_date = signal_dates.min()
-        first_signal_position = calendar_positions.get(first_signal_date)
-        if first_signal_position is None:
-            raise ValueError("交易日历中缺少首个防御信号日。")
-        required_history = defensive_config["ma_window"] - 1
-        if first_signal_position < required_history:
+        history_days = defensive_config["ma_window"] - 1
+        if engine_start_position < history_days:
             raise ValueError(
-                "首个信号日前的交易日不足以计算防御均线："
-                f"需要 MA{defensive_config['ma_window']} 的完整历史窗口。"
+                f"首个决策日前历史不足，无法计算 MA{defensive_config['ma_window']}。"
             )
-
         defensive_data_start = trading_calendar[
-            first_signal_position - required_history
+            engine_start_position - history_days
         ]
         if show_progress:
             _render_progress(
-                1,
-                8,
-                "读取防御基准并计算信号日均线",
-                started_at,
-                completed=0,
-                total=1,
+                1, 8, "读取日频防御基准并计算 MA", started_at,
+                completed=0, total=1,
                 current=defensive_config["market_index_code"],
                 detail=(
                     f"MA{defensive_config['ma_window']}，"
                     f"{defensive_data_start:%Y-%m-%d} 至 "
-                    f"{signal_dates.max():%Y-%m-%d}"
+                    f"{decision_dates.max():%Y-%m-%d}"
                 ),
             )
-        defensive_market_panel = load_market_daily_raw_data(
+        market_panel = load_market_daily_raw_data(
             standard_fields=["market_close"],
             market_index=defensive_config["market_index"],
             start_date=defensive_data_start,
-            end_date=signal_dates.max(),
+            end_date=decision_dates.max(),
             show_progress=show_progress,
         )
-        defensive_market_panel = _validate_panel(
-            defensive_market_panel,
-            "defensive_market_panel",
+        market_panel = _validate_panel(
+            market_panel, "defensive_market_panel",
             ["date", "market_index", "market_close"],
+            key_columns=["date", "market_index"],
         )
-        defensive_market_panel = defensive_market_panel.loc[
-            defensive_market_panel["market_index"]
-            == defensive_config["market_index"],
+        market_panel = market_panel.loc[
+            market_panel["market_index"] == defensive_config["market_index"],
             ["date", "market_close"],
         ].copy()
-        defensive_market_panel["market_close"] = pd.to_numeric(
-            defensive_market_panel["market_close"],
-            errors="coerce",
+        market_panel["market_close"] = pd.to_numeric(
+            market_panel["market_close"], errors="coerce"
         )
-        if defensive_market_panel["market_close"].isna().any():
-            raise ValueError("防御基准收盘价存在缺失或非数值数据。")
-        defensive_market_panel = defensive_market_panel.drop_duplicates(
-            subset=["date"],
-            keep=False,
-        ).set_index("date")
-        defensive_dates = trading_calendar[
-            (trading_calendar >= defensive_data_start)
-            & (trading_calendar <= signal_dates.max())
-        ]
-        defensive_close = defensive_market_panel["market_close"].reindex(
-            defensive_dates
+        if market_panel["market_close"].isna().any():
+            raise ValueError("防御基准收盘价存在缺失或非数值。")
+        if market_panel.duplicated("date").any():
+            raise ValueError("防御基准同一日期存在重复收盘价。")
+        market_close = market_panel.set_index("date")["market_close"].reindex(
+            trading_calendar[
+                (trading_calendar >= defensive_data_start)
+                & (trading_calendar <= decision_dates.max())
+            ]
         )
-        if defensive_close.isna().any():
-            missing_dates = defensive_close.index[defensive_close.isna()]
-            raise ValueError(
-                "防御基准缺少交易日收盘价："
-                f"{[date.strftime('%Y-%m-%d') for date in missing_dates[:5]]}"
-            )
-        defensive_ma = defensive_close.rolling(
-            window=defensive_config["ma_window"],
+        if market_close.isna().any():
+            raise ValueError("防御基准缺少部分交易日收盘价。")
+        market_ma = market_close.rolling(
+            defensive_config["ma_window"],
             min_periods=defensive_config["ma_window"],
         ).mean()
         defensive_frame = pd.DataFrame(
             {
-                "market_close": defensive_close.reindex(signal_dates),
-                "market_ma": defensive_ma.reindex(signal_dates),
+                "market_close": market_close.reindex(decision_dates),
+                "market_ma": market_ma.reindex(decision_dates),
             },
-            index=signal_dates,
+            index=decision_dates,
         )
         if defensive_frame.isna().any(axis=None):
-            raise ValueError("防御信号日未能计算完整的基准均线。")
+            raise ValueError("部分决策日无法计算完整防御均线。")
         defensive_signal_by_date = {
             row.Index: {
-                "is_defensive": bool(
-                    row.market_close < row.market_ma
-                ),
+                "is_defensive": bool(row.market_close < row.market_ma),
                 "market_close": float(row.market_close),
                 "market_ma": float(row.market_ma),
             }
@@ -1343,80 +1266,37 @@ def run_defensive_market_cap_group_backtest(
         }
         if show_progress:
             _render_progress(
-                1,
-                8,
-                "防御信号准备完成",
-                started_at,
-                completed=1,
-                total=1,
+                1, 8, "日频防御信号准备完成", started_at,
+                completed=1, total=1,
                 detail=(
-                    f"触发{sum(item['is_defensive'] for item in defensive_signal_by_date.values())}"
-                    f"/{len(defensive_signal_by_date)}个信号日"
+                    f"防御日{sum(x['is_defensive'] for x in defensive_signal_by_date.values())}"
+                    f"/{len(defensive_signal_by_date)}"
                 ),
             )
-    if show_progress:
-        _render_progress(
-            1,
-            8,
-            "调仓计划生成完成",
-            started_at,
-            completed=1,
-            total=1,
-            detail=f"{len(schedule)}个信号/执行日组合",
-        )
 
     metadata = get_factor_metadata(factor_name)
     factor_column = _resolve_factor_column(metadata, factor_name)
-
     universe_panel, load_instruments = _build_universe_panel(
-        universe_config,
-        signal_dates,
-        show_progress=show_progress,
-        started_at=started_at,
+        universe_config, signal_dates,
+        show_progress=show_progress, started_at=started_at,
     )
-    if defensive_config is not None and load_instruments is not None:
-        # 自定义/指数股票池需要额外读取补偿股票的信号日、执行日状态；
-        # 不把它们并入 universe_panel，因此因子选股范围完全不变。
-        load_instruments = sorted(
-            set(load_instruments).union(
-                defensive_config["compensation_instruments"]
-            )
-        )
-
     if factor_panel_provider is None:
-        requirements = get_factor_data_requirements(
-            factor_name,
-            factor_params,
-        )
-        # loader 已经把 FACTOR 默认值与用户 factor_params 合并完成。
-        # 数据窗口解析和最终因子计算必须共用这一份参数，避免预热口径与
-        # 实际计算口径不一致。target_dates、as_of_date 和进度参数仍由
-        # 策略统一控制，因此不从 resolved_factor_params 中重复传入。
+        requirements = get_factor_data_requirements(factor_name, factor_params)
         resolved_factor_params = {
             name: value
-            for name, value in requirements[
-                "resolved_factor_params"
-            ].items()
+            for name, value in requirements["resolved_factor_params"].items()
             if name not in _RESERVED_FACTOR_PARAMS
         }
-        history_days = _resolve_data_window(requirements)
+        factor_history_days = _resolve_data_window(requirements)
         factor_date_windows, factor_dates = _build_factor_date_windows(
-            schedule=schedule,
-            trading_calendar=trading_calendar,
-            history_days=history_days,
+            schedule, trading_calendar, factor_history_days
         )
         if show_progress:
             _render_progress(
-                2,
-                8,
-                "预存因子原始数据",
-                started_at,
-                completed=0,
-                total=1,
-                current=factor_name,
+                2, 8, "预存因子原始数据", started_at,
+                completed=0, total=1, current=factor_name,
                 detail=f"{len(factor_dates)}个所需日期",
             )
-
         factor_raw_bundle = load_factor_raw_data(
             factor_name=factor_name,
             dates=factor_dates,
@@ -1426,106 +1306,54 @@ def run_defensive_market_cap_group_backtest(
         )
         factor_raw_data = _validate_panel(
             factor_raw_bundle.get_security_daily(),
-            "factor_raw_data",
-            ["date", "instrument"],
+            "factor_raw_data", ["date", "instrument"],
         )
         factor_raw_bundle = factor_raw_bundle.with_domain(
-            "security_daily",
-            factor_raw_data,
+            "security_daily", factor_raw_data,
             key_columns=("date", "instrument"),
         )
         provided_factor_panel = None
         factor_loading_mode = "raw_dependency_preload"
-        if show_progress:
-            _render_progress(
-                2,
-                8,
-                "因子原始数据预存完成",
-                started_at,
-                completed=1,
-                total=1,
-                current=factor_name,
-                detail=f"股票域{len(factor_raw_data):,}行",
-            )
     else:
-        # 流式提供器自行负责因子的特征读取、逐批计算与内存回收；策略层
-        # 只持有最终 date/instrument/factor-value 面板。
         requirements = None
         resolved_factor_params = {}
-        history_days = None
+        factor_history_days = None
         factor_date_windows = None
         factor_raw_bundle = None
         factor_raw_data = pd.DataFrame(columns=["date", "instrument"])
         factor_loading_mode = "factor_panel_provider"
         if show_progress:
             _render_progress(
-                2,
-                8,
-                "调用流式因子面板提供器",
-                started_at,
-                completed=0,
-                total=1,
-                current=factor_name,
+                2, 8, "调用流式因子面板提供器", started_at,
+                completed=0, total=1, current=factor_name,
                 detail=f"{len(signal_dates)}个信号日",
             )
         provided_factor_panel = _run_with_stage_heartbeat(
             lambda: factor_panel_provider(signal_dates.copy()),
-            2,
-            8,
-            "流式因子面板生成",
-            started_at,
-            show_progress,
-            current=factor_name,
-            detail=f"{len(signal_dates)}个信号日",
+            2, 8, "流式因子面板生成", started_at, show_progress,
+            current=factor_name, detail=f"{len(signal_dates)}个信号日",
         )
         provided_factor_panel = _validate_panel(
             provided_factor_panel,
             "factor_panel_provider 输出",
             ["date", "instrument", factor_column],
         )
-        unexpected_dates = pd.DatetimeIndex(
+        actual_factor_dates = pd.DatetimeIndex(
             provided_factor_panel["date"].unique()
-        ).difference(signal_dates)
-        if len(unexpected_dates) > 0:
-            raise ValueError(
-                "factor_panel_provider 返回了非信号日数据："
-                f"{[date.strftime('%Y-%m-%d') for date in unexpected_dates[:5]]}"
-            )
-        missing_dates = signal_dates.difference(
-            pd.DatetimeIndex(provided_factor_panel["date"].unique())
         )
-        if len(missing_dates) > 0:
-            raise ValueError(
-                "factor_panel_provider 缺少信号日因子截面："
-                f"{[date.strftime('%Y-%m-%d') for date in missing_dates[:5]]}"
-            )
-        if show_progress:
-            _render_progress(
-                2,
-                8,
-                "流式因子面板生成完成",
-                started_at,
-                completed=1,
-                total=1,
-                current=factor_name,
-                detail=f"{len(provided_factor_panel):,}行",
-            )
+        if (
+            len(actual_factor_dates.difference(signal_dates)) > 0
+            or len(signal_dates.difference(actual_factor_dates)) > 0
+        ):
+            raise ValueError("factor_panel_provider 未精确覆盖全部因子信号日。")
 
     signal_fields = [
-        "total_market_cap",
-        "is_risk_warning",
-        "suspended",
-        "volume",
+        "total_market_cap", "is_risk_warning", "suspended", "volume",
     ]
     if show_progress:
         _render_progress(
-            3,
-            8,
-            "预存信号日选股状态",
-            started_at,
-            completed=0,
-            total=1,
-            detail=f"{len(signal_dates)}个信号日",
+            3, 8, "预存因子信号日选股状态", started_at,
+            completed=0, total=1, detail=f"{len(signal_dates)}个信号日",
         )
     signal_panel = load_daily_raw_data(
         standard_fields=signal_fields,
@@ -1533,178 +1361,241 @@ def run_defensive_market_cap_group_backtest(
         instruments=load_instruments,
         show_progress=show_progress,
     )
-    signal_panel = _validate_panel(
-        signal_panel,
-        "signal_panel",
-        ["date", "instrument", *signal_fields],
-    )
     signal_panel = _prepare_signal_state(
-        signal_panel,
+        _validate_panel(
+            signal_panel, "signal_panel",
+            ["date", "instrument", *signal_fields],
+        ),
         universe_panel,
     )
-    if show_progress:
-        _render_progress(
-            3,
-            8,
-            "信号日选股状态准备完成",
-            started_at,
-            completed=1,
-            total=1,
-            detail=f"{len(signal_panel):,}行",
-        )
-
-    execution_fields = [
-        "volume",
-        "upper_limit",
-        "lower_limit",
-        "is_risk_warning",
-        "suspended",
-    ]
-    for field in (buy_price_field, sell_price_field):
-        if field == "vwap":
-            execution_fields.extend(["amount", "volume"])
-        else:
-            execution_fields.append(field)
-    execution_fields = list(dict.fromkeys(execution_fields))
-
-    if show_progress:
-        _render_progress(
-            4,
-            8,
-            "预存执行日交易约束",
-            started_at,
-            completed=0,
-            total=1,
-            detail=f"{len(execution_dates)}个执行日",
-        )
-    execution_panel = load_daily_raw_data(
-        standard_fields=execution_fields,
-        dates=execution_dates,
-        instruments=load_instruments,
-        show_progress=show_progress,
-    )
-    execution_panel = _validate_panel(
-        execution_panel,
-        "execution_panel",
-        ["date", "instrument", *execution_fields],
-    )
-    execution_panel = _prepare_execution_state(
-        execution_panel,
-        buy_price_field=buy_price_field,
-        sell_price_field=sell_price_field,
-    )
-    if show_progress:
-        _render_progress(
-            4,
-            8,
-            "执行日交易约束准备完成",
-            started_at,
-            completed=1,
-            total=1,
-            detail=f"{len(execution_panel):,}行",
-        )
-
     signal_state_by_date = {
-        date: group.copy()
-        for date, group in signal_panel.groupby("date", sort=False)
+        date: frame.copy()
+        for date, frame in signal_panel.groupby("date", sort=False)
     }
-    execution_state_map = {}
-    execution_state_columns = [
-        "date",
-        "instrument",
-        "can_buy",
-        "can_sell",
-        "buy_blocked_reason",
-        "sell_blocked_reason",
-        "_buy_price",
-        "_sell_price",
-    ]
-    execution_state_rows = execution_panel[execution_state_columns]
-    total_execution_rows = len(execution_state_rows)
-    for position, row in enumerate(
-        execution_state_rows.itertuples(index=False, name=None),
-        start=1,
-    ):
-        (
-            row_date,
-            instrument,
-            can_buy,
-            can_sell,
-            buy_blocked_reason,
-            sell_blocked_reason,
-            buy_price,
-            sell_price,
-        ) = row
-        execution_state_map[(row_date, instrument)] = {
-            "can_buy": bool(can_buy),
-            "can_sell": bool(can_sell),
-            "buy_blocked_reason": buy_blocked_reason,
-            "sell_blocked_reason": sell_blocked_reason,
-            "buy_price": buy_price,
-            "sell_price": sell_price,
-        }
-        if show_progress and (
-            position == 1
-            or position % 5000 == 0
-            or position == total_execution_rows
-        ):
-            _render_progress(
-                5,
-                8,
-                "建立执行约束快速索引",
-                started_at,
-                completed=position,
-                total=total_execution_rows,
-                current=f"{row_date:%Y-%m-%d} {instrument}",
-            )
+    if show_progress:
+        _render_progress(
+            3, 8, "因子信号日选股状态准备完成", started_at,
+            completed=1, total=1, detail=f"{len(signal_panel):,}行",
+        )
 
-    schedule_by_signal = {
-        row.signal_date: {
-            "rebalance_number": int(row.rebalance_number),
-            "execution_date": row.execution_date,
-        }
-        for row in schedule.itertuples(index=False)
-    }
     provided_factor_by_date = (
         {
-            date: panel.copy()
-            for date, panel in provided_factor_panel.groupby("date", sort=False)
+            date: frame.copy()
+            for date, frame in provided_factor_panel.groupby("date", sort=False)
         }
         if provided_factor_panel is not None
         else None
     )
-
-    engine_instruments = sorted(signal_panel["instrument"].unique())
-    if not engine_instruments:
-        raise ValueError("没有可供 BigTrader 订阅的股票代码。")
-
+    factor_plan_by_signal = {}
     signal_records = []
     rebalance_records = []
-    execution_records = []
-    order_records = []
-    trade_records = []
-    completed_signal_count = 0
     successful_signal_count = 0
-    defensive_rebalance_count = 0
     if show_progress:
         _render_progress(
-            6,
-            8,
-            "启动 BigTrader 原生回测",
-            started_at,
-            completed=0,
-            total=len(schedule),
+            4, 8, "构建20日因子目标组合", started_at,
+            completed=0, total=len(schedule), current=factor_name,
+        )
+    for position, row in enumerate(schedule.itertuples(index=False), start=1):
+        signal_date = row.signal_date
+        execution_date = row.execution_date
+        rebalance_number = int(row.rebalance_number)
+        try:
+            if provided_factor_by_date is None:
+                if factor_date_windows is None or factor_raw_bundle is None:
+                    raise RuntimeError(
+                        "原始因子预存路径缺少日期窗口或数据包。"
+                    )
+                required_dates = factor_date_windows[signal_date]
+                for domain_name in factor_raw_bundle.domain_names:
+                    if len(
+                        factor_raw_bundle.missing_dates(
+                            domain_name, required_dates
+                        )
+                    ) > 0:
+                        raise ValueError(
+                            f"数据域 {domain_name!r} 的因子预热日期缺失。"
+                        )
+                factor_input = factor_raw_bundle.select_dates(required_dates)
+                factor_cross_section = _run_with_stage_heartbeat(
+                    lambda: get_factor(
+                        factor_name, factor_input,
+                        target_dates=[signal_date], as_of_date=signal_date,
+                        show_progress=False, progress_every=progress_every,
+                        **resolved_factor_params,
+                    ),
+                    4, 8, "计算信号日因子", started_at, show_progress,
+                    current=f"{signal_date:%Y-%m-%d} {factor_name}",
+                )
+            else:
+                factor_cross_section = provided_factor_by_date.get(signal_date)
+                if factor_cross_section is None or factor_cross_section.empty:
+                    raise ValueError("流式因子面板缺少当前信号日截面。")
+            factor_cross_section = _validate_panel(
+                factor_cross_section,
+                f"{factor_name}@{signal_date:%Y-%m-%d}",
+                ["date", "instrument", factor_column],
+            )
+            selected, statistics = _select_cross_section(
+                factor_cross_section=factor_cross_section,
+                signal_state=signal_state_by_date[signal_date],
+                factor_column=factor_column,
+                group_count=market_cap_group_count,
+                selected_groups=selected_groups,
+                quantile_lower=quantile_lower,
+                quantile_upper=quantile_upper,
+            )
+            target_weights = dict(
+                zip(selected["instrument"], selected["target_weight"])
+            )
+            factor_plan_by_signal[signal_date] = {
+                "rebalance_number": rebalance_number,
+                "target_weights": target_weights,
+                "status": "ok" if target_weights else "empty_target",
+            }
+            successful_signal_count += 1
+            status, error_message = factor_plan_by_signal[signal_date]["status"], ""
+            if not selected.empty:
+                selected = selected.copy()
+                selected["signal_date"] = signal_date
+                selected["execution_date"] = execution_date
+                selected["factor_name"] = factor_name
+                selected["factor_value"] = selected[factor_column]
+                selected["rebalance_number"] = rebalance_number
+                selected["base_target_weight"] = selected["target_weight"]
+                signal_records.extend(
+                    selected[
+                        [
+                            "rebalance_number", "signal_date", "execution_date",
+                            "instrument", "total_market_cap", "market_cap_group",
+                            "factor_name", "factor_value", "factor_quantile",
+                            "base_target_weight",
+                        ]
+                    ].to_dict("records")
+                )
+        except Exception as exc:
+            statistics = {
+                "candidate_count": 0, "eligible_count": 0,
+                "actual_group_count": 0, "group_populations": {},
+                "selected_counts": {},
+            }
+            status, error_message = "skipped_error", f"{type(exc).__name__}: {exc}"
+            factor_plan_by_signal[signal_date] = {
+                "rebalance_number": rebalance_number,
+                "target_weights": None,
+                "status": status,
+            }
+        rebalance_records.append(
+            {
+                "rebalance_number": rebalance_number,
+                "signal_date": signal_date,
+                "execution_date": execution_date,
+                "status": status,
+                "error_message": error_message,
+                **statistics,
+                "target_count": len(
+                    factor_plan_by_signal[signal_date]["target_weights"] or {}
+                ),
+            }
+        )
+        if show_progress and (
+            position == 1
+            or position % progress_every == 0
+            or position == len(schedule)
+        ):
+            _render_progress(
+                4, 8, "构建20日因子目标组合", started_at,
+                completed=position, total=len(schedule),
+                current=f"{signal_date:%Y-%m-%d}",
+                detail=f"{status}，目标{len(factor_plan_by_signal[signal_date]['target_weights'] or {})}只",
+            )
+
+    engine_instruments = sorted(
+        set(
+            instrument
+            for plan in factor_plan_by_signal.values()
+            for instrument in (plan["target_weights"] or {})
+        ).union(
+            defensive_config["compensation_instruments"]
+            if defensive_config is not None
+            else []
+        )
+    )
+    if not engine_instruments:
+        raise ValueError("没有有效因子目标股票，无法启动回测。")
+    execution_fields = [
+        "volume", "upper_limit", "lower_limit", "is_risk_warning", "suspended",
+    ]
+    for field in (buy_price_field, sell_price_field):
+        execution_fields.extend(
+            ["amount", "volume"] if field == "vwap" else [field]
+        )
+    execution_fields = list(dict.fromkeys(execution_fields))
+    if show_progress:
+        _render_progress(
+            5, 8, "预存日频防御切换交易约束", started_at,
+            completed=0, total=1,
             detail=(
-                f"{len(schedule)}个信号，"
-                f"{len(engine_instruments):,}只候选股票"
+                f"{len(daily_execution_dates)}个执行日，"
+                f"{len(engine_instruments)}只候选股票"
             ),
         )
+    execution_panel = load_daily_raw_data(
+        standard_fields=execution_fields,
+        dates=daily_execution_dates,
+        instruments=engine_instruments,
+        show_progress=show_progress,
+    )
+    execution_panel = _prepare_execution_state(
+        _validate_panel(
+            execution_panel, "execution_panel",
+            ["date", "instrument", *execution_fields],
+        ),
+        buy_price_field=buy_price_field,
+        sell_price_field=sell_price_field,
+    )
+    execution_state_map = {
+        (row.date, row.instrument): {
+            "can_buy": bool(row.can_buy),
+            "can_sell": bool(row.can_sell),
+            "buy_blocked_reason": row.buy_blocked_reason,
+            "sell_blocked_reason": row.sell_blocked_reason,
+        }
+        for row in execution_panel[
+            [
+                "date", "instrument", "can_buy", "can_sell",
+                "buy_blocked_reason", "sell_blocked_reason",
+            ]
+        ].itertuples(index=False)
+    }
+    if show_progress:
+        _render_progress(
+            5, 8, "日频防御切换交易约束准备完成", started_at,
+            completed=1, total=1, detail=f"{len(execution_panel):,}行",
+        )
 
+    execution_records = []
+    defensive_records = []
+    order_records = []
+    trade_records = []
+    latest_factor_target_weights = None
+    latest_rebalance_number = None
+    applied_defensive_active = None
+    daily_decision_count = 0
+    daily_switch_count = 0
+    defensive_day_count = 0
+    defensive_entry_count = 0
+    defensive_exit_count = 0
+
+    if show_progress:
+        _render_progress(
+            6, 8, "启动 BigTrader：日频 MA 监控与必要调仓", started_at,
+            completed=0, total=len(decision_dates),
+            detail=f"因子计划{len(schedule)}次",
+        )
     from bigmodule import M
 
     def initialize(context):
         from bigtrader.finance.commission import PerOrder
-
         context.set_commission(
             PerOrder(
                 buy_cost=trading_costs["buy_cost"],
@@ -1715,241 +1606,34 @@ def run_defensive_market_cap_group_backtest(
         )
         if slippage_value is not None:
             context.set_slippage_value(
-                slippage_type=2,
-                slippage_value=slippage_value,
+                slippage_type=2, slippage_value=slippage_value
             )
 
-    def handle_data(context, data):
-        nonlocal completed_signal_count
-        nonlocal successful_signal_count
-        nonlocal defensive_rebalance_count
-
-        signal_date = pd.Timestamp(data.current_dt).normalize()
-        schedule_item = schedule_by_signal.get(signal_date)
-        if schedule_item is None:
-            return
-
-        completed_signal_count += 1
-        execution_date = schedule_item["execution_date"]
-        rebalance_number = schedule_item["rebalance_number"]
-
-        if show_progress:
-            _render_progress(
-                6,
-                8,
-                (
-                    "回测中：读取流式因子信号"
-                    if provided_factor_by_date is not None
-                    else "回测中：计算单日因子信号"
-                ),
-                started_at,
-                completed=completed_signal_count - 1,
-                total=len(schedule),
-                current=f"{signal_date:%Y-%m-%d}",
-                detail=f"第{rebalance_number}次调仓",
-            )
-
-        defensive_state = (
-            defensive_signal_by_date.get(signal_date)
-            if defensive_signal_by_date is not None
-            else None
-        )
-        defensive_active = bool(
-            defensive_state is not None
-            and defensive_state["is_defensive"]
-        )
-        # 将“本次确已触发防御”收窄为非空配置，既表达运行时前置条件，
-        # 也避免静态检查器把 defensive_config 误判为 Optional。
-        active_defensive_config = (
-            defensive_config if defensive_active else None
-        )
-        try:
-            if provided_factor_by_date is None:
-                # 该分支仅由原始批量加载路径进入；断言同时为静态检查器
-                # 明确收窄 Optional 类型，不影响任何运行时计算。
-                assert factor_date_windows is not None
-                assert factor_raw_bundle is not None
-                required_dates = factor_date_windows[signal_date]
-                for domain_name in factor_raw_bundle.domain_names:
-                    missing_dates = factor_raw_bundle.missing_dates(
-                        domain_name,
-                        required_dates,
-                    )
-                    if len(missing_dates) > 0:
-                        missing_text = [
-                            date.strftime("%Y-%m-%d")
-                            for date in missing_dates[:5]
-                        ]
-                        raise ValueError(
-                            f"数据域 {domain_name!r} 的因子预热窗口"
-                            f"缺少日期：{missing_text}"
-                        )
-
-                factor_input = factor_raw_bundle.select_dates(required_dates)
-                factor_cross_section = _run_with_stage_heartbeat(
-                    lambda: get_factor(
-                        factor_name,
-                        factor_input,
-                        target_dates=[signal_date],
-                        as_of_date=signal_date,
-                        show_progress=False,
-                        progress_every=progress_every,
-                        **resolved_factor_params,
-                    ),
-                    6,
-                    8,
-                    "回测中：计算信号日因子",
-                    started_at,
-                    show_progress,
-                    current=f"{signal_date:%Y-%m-%d}，{factor_name}",
-                )
-            else:
-                factor_cross_section = provided_factor_by_date.get(signal_date)
-                if factor_cross_section is None or factor_cross_section.empty:
-                    raise ValueError("流式因子面板缺少当前信号日的有效截面。")
-            if show_progress:
-                _render_progress(
-                    6,
-                    8,
-                    "回测中：市值分组和因子分位选股",
-                    started_at,
-                    completed=completed_signal_count - 1,
-                    total=len(schedule),
-                    current=f"{signal_date:%Y-%m-%d}",
-                    detail=f"因子结果{len(factor_cross_section):,}行",
-                )
-            factor_cross_section = _validate_panel(
-                factor_cross_section,
-                f"{factor_name}@{signal_date:%Y-%m-%d}",
-                ["date", "instrument", factor_column],
-            )
-
-            signal_state = signal_state_by_date.get(signal_date)
-            if signal_state is None or signal_state.empty:
-                raise ValueError("信号日缺少选股状态数据。")
-
-            selected, statistics = _select_cross_section(
-                factor_cross_section=factor_cross_section,
-                signal_state=signal_state,
-                factor_column=factor_column,
-                group_count=market_cap_group_count,
-                selected_groups=selected_groups,
-                quantile_lower=quantile_lower,
-                quantile_upper=quantile_upper,
-            )
-            if active_defensive_config is not None and not selected.empty:
-                # 原选股总权重由 100% 缩放至 defensive_strategy_weight；
-                # 未分配部分随后才等权转入调用方指定的补偿股票。
-                selected = selected.copy()
-                selected["target_weight"] *= active_defensive_config[
-                    "strategy_weight"
-                ]
-            successful_signal_count += 1
-            status = "ok" if not selected.empty else "empty_target"
-            error_message = ""
-
-        except Exception as exc:
-            selected = pd.DataFrame()
-            statistics = {
-                "candidate_count": 0,
-                "eligible_count": 0,
-                "actual_group_count": 0,
-                "group_populations": {},
-                "selected_counts": {},
-            }
-            status = "skipped_error"
-            error_message = f"{type(exc).__name__}: {exc}"
-            defensive_active = False
-            active_defensive_config = None
-
-        rebalance_records.append(
-            {
-                "rebalance_number": rebalance_number,
-                "signal_date": signal_date,
-                "execution_date": execution_date,
-                "status": status,
-                "error_message": error_message,
-                **statistics,
-                "target_count": len(selected),
-            }
-        )
-
-        if status == "skipped_error":
-            if show_progress:
-                _render_progress(
-                    6,
-                    8,
-                    "回测中：当前信号因异常跳过",
-                    started_at,
-                    completed=completed_signal_count,
-                    total=len(schedule),
-                    current=f"{signal_date:%Y-%m-%d}",
-                    detail=error_message,
-                )
-            return
-
-        target_weights = {}
-        if not selected.empty:
-            selected = selected.copy()
-            selected["signal_date"] = signal_date
-            selected["execution_date"] = execution_date
-            selected["factor_name"] = factor_name
-            selected["factor_value"] = selected[factor_column]
-            selected["rebalance_number"] = rebalance_number
-            signal_records.extend(
-                selected[
-                    [
-                        "rebalance_number",
-                        "signal_date",
-                        "execution_date",
-                        "instrument",
-                        "total_market_cap",
-                        "market_cap_group",
-                        "factor_name",
-                        "factor_value",
-                        "factor_quantile",
-                        "target_weight",
-                    ]
-                ].to_dict("records")
-            )
-            target_weights = dict(
-                zip(
-                    selected["instrument"],
-                    selected["target_weight"],
-                )
-            )
-
-        if active_defensive_config is not None:
-            defensive_rebalance_count += 1
-            compensation_weight = (
-                1.0 - active_defensive_config["strategy_weight"]
-            ) / len(active_defensive_config["compensation_instruments"])
-            for instrument in active_defensive_config["compensation_instruments"]:
-                target_weights[instrument] = (
-                    float(target_weights.get(instrument, 0.0))
-                    + compensation_weight
-                )
-
+    def submit_target_weights(
+        context,
+        decision_date,
+        execution_date,
+        target_weights,
+        event_type,
+        rebalance_number,
+    ):
         positions, current_weights = _current_position_weights(context)
         holding_instruments = {
             instrument
             for instrument, position in positions.items()
             if _get_position_quantity(position) > 0
         }
-        all_instruments = holding_instruments.union(target_weights)
-
-        sell_intents = []
-        buy_intents = []
-        for instrument in sorted(all_instruments):
+        sell_intents, buy_intents = [], []
+        for instrument in sorted(holding_instruments.union(target_weights)):
             current_weight = current_weights.get(instrument, 0.0)
             target_weight = float(target_weights.get(instrument, 0.0))
-
             if not np.isfinite(current_weight):
                 execution_records.append(
                     {
-                        "rebalance_number": rebalance_number,
-                        "signal_date": signal_date,
+                        "decision_date": decision_date,
                         "execution_date": execution_date,
+                        "event_type": event_type,
+                        "rebalance_number": rebalance_number,
                         "instrument": instrument,
                         "current_weight": np.nan,
                         "target_weight": target_weight,
@@ -1962,158 +1646,237 @@ def run_defensive_market_cap_group_backtest(
                     }
                 )
                 continue
-
-            delta = target_weight - current_weight
-            if abs(delta) <= weight_tolerance:
+            if abs(target_weight - current_weight) <= weight_tolerance:
                 continue
-            intent = (
-                instrument,
-                current_weight,
-                target_weight,
+            (sell_intents if target_weight < current_weight else buy_intents).append(
+                (instrument, current_weight, target_weight)
             )
-            if delta < 0:
-                sell_intents.append(intent)
-            else:
-                buy_intents.append(intent)
 
-        # 先提交卖出/减仓，再提交买入/加仓。
-        total_intents = len(sell_intents) + len(buy_intents)
-        completed_intents = 0
-        for direction, intents in (
-            ("sell", sell_intents),
-            ("buy", buy_intents),
-        ):
+        submitted_count, blocked_count = 0, 0
+        for direction, intents in (("sell", sell_intents), ("buy", buy_intents)):
             for instrument, current_weight, target_weight in intents:
-                state = execution_state_map.get(
-                    (execution_date, instrument)
-                )
+                state = execution_state_map.get((execution_date, instrument))
                 if state is None:
-                    tradable = False
-                    blocked_reason = "missing_execution_data"
+                    tradable, blocked_reason = False, "missing_execution_data"
                 elif direction == "buy":
-                    tradable = state["can_buy"]
-                    blocked_reason = (
-                        "" if tradable else state["buy_blocked_reason"]
+                    tradable, blocked_reason = (
+                        state["can_buy"], state["buy_blocked_reason"]
                     )
                 else:
-                    tradable = state["can_sell"]
-                    blocked_reason = (
-                        "" if tradable else state["sell_blocked_reason"]
+                    tradable, blocked_reason = (
+                        state["can_sell"], state["sell_blocked_reason"]
                     )
-
                 submit_result = None
                 if tradable:
                     submit_result = context.order_target_percent(
-                        instrument,
-                        target_weight,
+                        instrument, target_weight
                     )
                     try:
-                        submit_succeeded = int(submit_result) >= 0
+                        submitted = int(submit_result) >= 0
                     except (TypeError, ValueError):
-                        submit_succeeded = submit_result is not None
-                    if not submit_succeeded:
-                        blocked_reason = (
-                            f"order_submit_failed:{submit_result}"
-                        )
+                        submitted = submit_result is not None
+                    if not submitted:
+                        blocked_reason = f"order_submit_failed:{submit_result}"
                 else:
-                    submit_succeeded = False
-
+                    submitted = False
+                submitted_count += int(submitted)
+                blocked_count += int(not submitted)
                 execution_records.append(
                     {
-                        "rebalance_number": rebalance_number,
-                        "signal_date": signal_date,
+                        "decision_date": decision_date,
                         "execution_date": execution_date,
+                        "event_type": event_type,
+                        "rebalance_number": rebalance_number,
                         "instrument": instrument,
                         "current_weight": current_weight,
                         "target_weight": target_weight,
                         "order_direction": direction,
                         "tradable": bool(tradable),
-                        "blocked_reason": blocked_reason,
+                        "blocked_reason": "" if submitted else blocked_reason,
                         "order_attempted": bool(tradable),
-                        "order_submitted": bool(submit_succeeded),
+                        "order_submitted": bool(submitted),
                         "submit_result": submit_result,
                     }
                 )
-                completed_intents += 1
-                if show_progress and (
-                    completed_intents == 1
-                    or completed_intents % 50 == 0
-                    or completed_intents == total_intents
-                ):
-                    _render_progress(
-                        6,
-                        8,
-                        "回测中：提交调仓订单",
-                        started_at,
-                        completed=completed_signal_count - 1,
-                        total=len(schedule),
-                        current=f"{signal_date:%Y-%m-%d}",
-                        detail=(
-                            f"订单{completed_intents}/{total_intents}，"
-                            f"{direction}:{instrument}"
-                        ),
-                    )
+        return len(sell_intents) + len(buy_intents), submitted_count, blocked_count
 
+    def handle_data(context, data):
+        nonlocal latest_factor_target_weights
+        nonlocal latest_rebalance_number
+        nonlocal applied_defensive_active
+        nonlocal daily_decision_count
+        nonlocal daily_switch_count
+        nonlocal defensive_day_count
+        nonlocal defensive_entry_count
+        nonlocal defensive_exit_count
+
+        decision_date = pd.Timestamp(data.current_dt).normalize()
+        execution_date = decision_to_execution.get(decision_date)
+        if execution_date is None:
+            return
+        daily_decision_count += 1
+        plan = factor_plan_by_signal.get(decision_date)
+        factor_rebalance_due = False
+        if plan is not None and plan["status"] != "skipped_error":
+            latest_factor_target_weights = dict(plan["target_weights"] or {})
+            latest_rebalance_number = plan["rebalance_number"]
+            factor_rebalance_due = True
+        if latest_factor_target_weights is None:
+            return
+
+        defensive_state = (
+            defensive_signal_by_date.get(decision_date)
+            if defensive_signal_by_date is not None else None
+        )
+        defensive_active = bool(
+            defensive_state is not None and defensive_state["is_defensive"]
+        )
+        if defensive_active:
+            defensive_day_count += 1
+        defense_entry = (
+            defensive_config is not None
+            and defensive_active
+            and applied_defensive_active is not True
+        )
+        defense_exit = (
+            defensive_config is not None
+            and not defensive_active
+            and applied_defensive_active is True
+        )
+        if defense_entry:
+            defensive_entry_count += 1
+        if defense_exit:
+            defensive_exit_count += 1
+        regime_changed = applied_defensive_active is None or (
+            defensive_active != applied_defensive_active
+        )
+        action_required = factor_rebalance_due or regime_changed
+        if factor_rebalance_due and defense_entry:
+            event_type = "factor_rebalance_and_defense_entry"
+        elif factor_rebalance_due and defense_exit:
+            event_type = "factor_rebalance_and_defense_exit"
+        elif factor_rebalance_due:
+            event_type = "factor_rebalance"
+        elif defense_entry:
+            event_type = "defense_entry"
+        elif defense_exit:
+            event_type = "defense_exit"
+        elif regime_changed:
+            event_type = "initial_target"
+        else:
+            event_type = "hold"
+
+        main_strategy_target_weight = 1.0
+        compensation_target_weight = 0.0
+        target_weights = dict(latest_factor_target_weights)
+        if defensive_active:
+            if defensive_config is None:
+                raise RuntimeError("日频防御状态与防御配置不一致。")
+            active_defensive_config = defensive_config
+            main_strategy_target_weight = active_defensive_config[
+                "strategy_weight"
+            ]
+            target_weights = {
+                instrument: weight * main_strategy_target_weight
+                for instrument, weight in target_weights.items()
+            }
+            compensation_target_weight = 1.0 - main_strategy_target_weight
+            each_weight = compensation_target_weight / len(
+                active_defensive_config["compensation_instruments"]
+            )
+            for instrument in active_defensive_config["compensation_instruments"]:
+                target_weights[instrument] = (
+                    float(target_weights.get(instrument, 0.0)) + each_weight
+                )
+
+        order_intent_count = 0
+        submitted_order_count = 0
+        blocked_order_count = 0
+        if action_required:
+            (
+                order_intent_count,
+                submitted_order_count,
+                blocked_order_count,
+            ) = submit_target_weights(
+                context,
+                decision_date,
+                execution_date,
+                target_weights,
+                event_type,
+                latest_rebalance_number,
+            )
+            applied_defensive_active = defensive_active
+            daily_switch_count += 1
+
+        defensive_records.append(
+            {
+                "decision_date": decision_date,
+                "execution_date": execution_date,
+                "is_defensive": defensive_active,
+                "market_close": (
+                    defensive_state["market_close"]
+                    if defensive_state is not None else np.nan
+                ),
+                "market_ma": (
+                    defensive_state["market_ma"]
+                    if defensive_state is not None else np.nan
+                ),
+                "defense_entry": bool(defense_entry),
+                "defense_exit": bool(defense_exit),
+                "factor_rebalance_due": bool(factor_rebalance_due),
+                "action_required": bool(action_required),
+                "event_type": event_type,
+                "rebalance_number": latest_rebalance_number,
+                "main_strategy_target_weight": main_strategy_target_weight,
+                "compensation_target_weight": compensation_target_weight,
+                "order_intent_count": order_intent_count,
+                "submitted_order_count": submitted_order_count,
+                "blocked_order_count": blocked_order_count,
+            }
+        )
         if show_progress and (
-            completed_signal_count == 1
-            or completed_signal_count % progress_every == 0
-            or completed_signal_count == len(schedule)
+            action_required
+            or daily_decision_count == 1
+            or daily_decision_count % progress_every == 0
+            or daily_decision_count == len(decision_dates)
         ):
             _render_progress(
-                6,
-                8,
-                "回测中：调仓信号处理完成",
-                started_at,
-                completed=completed_signal_count,
-                total=len(schedule),
-                current=f"{signal_date:%Y-%m-%d}",
-                detail=f"选中{len(selected)}只，订单意图{total_intents}个",
+                6, 8, "BigTrader：日频 MA 监控与调仓", started_at,
+                completed=daily_decision_count, total=len(decision_dates),
+                current=f"{decision_date:%Y-%m-%d}",
+                detail=(
+                    f"{event_type}，防御={defensive_active}，"
+                    f"订单{order_intent_count}"
+                ),
             )
 
     def handle_order(context, order):
         order_records.append(
             {
                 "trading_day": _get_first_attribute(
-                    order,
-                    ["trading_day", "insert_date"],
+                    order, ["trading_day", "insert_date"]
                 ),
                 "instrument": _get_first_attribute(
-                    order,
-                    ["instrument", "symbol"],
+                    order, ["instrument", "symbol"]
                 ),
-                "direction": str(
-                    _get_first_attribute(order, ["direction"], "")
-                ),
+                "direction": str(_get_first_attribute(order, ["direction"], "")),
                 "order_qty": _get_first_attribute(
-                    order,
-                    ["order_qty", "quantity"],
-                    np.nan,
+                    order, ["order_qty", "quantity"], np.nan
                 ),
                 "filled_qty": _get_first_attribute(
-                    order,
-                    ["filled_qty", "trade_qty"],
-                    np.nan,
+                    order, ["filled_qty", "trade_qty"], np.nan
                 ),
                 "order_price": _get_first_attribute(
-                    order,
-                    ["order_price", "price"],
-                    np.nan,
+                    order, ["order_price", "price"], np.nan
                 ),
                 "order_status": str(
-                    _get_first_attribute(
-                        order,
-                        ["order_status", "status"],
-                        "",
-                    )
+                    _get_first_attribute(order, ["order_status", "status"], "")
                 ),
                 "status_msg": _get_first_attribute(
-                    order,
-                    ["status_msg", "message"],
-                    "",
+                    order, ["status_msg", "message"], ""
                 ),
                 "order_key": _get_first_attribute(
-                    order,
-                    ["order_key", "order_id"],
+                    order, ["order_key", "order_id"]
                 ),
             }
         )
@@ -2122,52 +1885,37 @@ def run_defensive_market_cap_group_backtest(
         trade_records.append(
             {
                 "trading_day": _get_first_attribute(
-                    trade,
-                    ["trading_day", "trade_date"],
+                    trade, ["trading_day", "trade_date"]
                 ),
                 "trade_time": _get_first_attribute(
-                    trade,
-                    ["trade_time", "datetime"],
+                    trade, ["trade_time", "datetime"]
                 ),
                 "instrument": _get_first_attribute(
-                    trade,
-                    ["instrument", "symbol"],
+                    trade, ["instrument", "symbol"]
                 ),
-                "direction": str(
-                    _get_first_attribute(trade, ["direction"], "")
-                ),
+                "direction": str(_get_first_attribute(trade, ["direction"], "")),
                 "filled_qty": _get_first_attribute(
-                    trade,
-                    ["filled_qty", "trade_qty", "quantity"],
-                    np.nan,
+                    trade, ["filled_qty", "trade_qty", "quantity"], np.nan
                 ),
                 "filled_price": _get_first_attribute(
-                    trade,
-                    ["filled_price", "trade_price", "price"],
-                    np.nan,
+                    trade, ["filled_price", "trade_price", "price"], np.nan
                 ),
                 "filled_money": _get_first_attribute(
-                    trade,
-                    ["filled_money", "trade_amount", "amount"],
-                    np.nan,
+                    trade, ["filled_money", "trade_amount", "amount"], np.nan
                 ),
                 "commission": _get_first_attribute(
-                    trade,
-                    ["commission", "fee"],
-                    np.nan,
+                    trade, ["commission", "fee"], np.nan
                 ),
                 "order_key": _get_first_attribute(
-                    trade,
-                    ["order_key", "order_id"],
+                    trade, ["order_key", "order_id"]
                 ),
             }
         )
 
     bigtrader_kwargs = {
         "data": {"instruments": engine_instruments},
-        # 为了让首次执行日能够使用前一交易日信号，内部回测起点前移至首个信号日。
-        "start_date": schedule["signal_date"].iloc[0].strftime("%Y-%m-%d"),
-        "end_date": end_date.strftime("%Y-%m-%d"),
+        "start_date": engine_start_date.strftime("%Y-%m-%d"),
+        "end_date": effective_end_date.strftime("%Y-%m-%d"),
         "initialize": initialize,
         "handle_data": handle_data,
         "handle_order": handle_order,
@@ -2177,71 +1925,43 @@ def run_defensive_market_cap_group_backtest(
         "volume_limit": volume_limit,
         "order_price_field_buy": buy_price_field,
         "order_price_field_sell": sell_price_field,
-        # 回调函数闭包中保存了本次调仓计划、因子数据和审计容器。
-        # 必须关闭模块结果缓存，避免复用上一次运行的回测结果，导致
-        # 当前回调未执行或审计记录仍为零。
         "m_cached": False,
     }
     if benchmark is not None:
         bigtrader_kwargs["benchmark"] = benchmark
-
     if show_progress:
-        # 避免 BigTrader 原生日志接在单行进度文字之后。
         print()
     performance = M.bigtrader.v35(**bigtrader_kwargs)
 
     if show_progress:
         _render_progress(
-            7,
-            8,
-            "BigTrader运行完成，整理审计结果",
-            started_at,
-            completed=completed_signal_count,
-            total=len(schedule),
-            detail=f"成功信号{successful_signal_count}个",
+            7, 8, "BigTrader运行完成，整理审计结果", started_at,
+            completed=daily_decision_count, total=len(decision_dates),
+            detail=f"日频目标调整{daily_switch_count}次",
         )
 
     signals = pd.DataFrame(signal_records)
     rebalance_audit = pd.DataFrame(rebalance_records)
+    defensive_audit = pd.DataFrame(defensive_records)
     execution_audit = pd.DataFrame(execution_records)
     order_audit = pd.DataFrame(order_records)
     trade_audit = pd.DataFrame(trade_records)
-
-    if show_progress:
-        _render_progress(
-            8,
-            8,
-            "回测与审计结果整理完成",
-            started_at,
-            completed=1,
-            total=1,
-            detail=(
-                f"信号{len(signals):,}条，订单{len(order_audit):,}条，"
-                f"成交{len(trade_audit):,}条"
-            ),
-        )
-        print()
-
     data_diagnostics = {
         "requested_start_date": start_date,
         "actual_first_execution_date": schedule["execution_date"].iloc[0],
-        "engine_start_date": schedule["signal_date"].iloc[0],
-        "end_date": end_date,
-        "factor_history_days": history_days,
+        "engine_start_date": engine_start_date,
+        "end_date": effective_end_date,
+        "factor_history_days": factor_history_days,
         "factor_loading_mode": factor_loading_mode,
-        "resolved_factor_params": dict(
-            resolved_factor_params
-        ),
+        "resolved_factor_params": dict(resolved_factor_params),
         "factor_raw_rows": len(factor_raw_data),
         "factor_domain_rows": (
             factor_raw_bundle.row_counts()
-            if factor_raw_bundle is not None
-            else {}
+            if factor_raw_bundle is not None else {}
         ),
         "provided_factor_rows": (
             len(provided_factor_panel)
-            if provided_factor_panel is not None
-            else 0
+            if provided_factor_panel is not None else 0
         ),
         "signal_state_rows": len(signal_panel),
         "execution_state_rows": len(execution_panel),
@@ -2254,23 +1974,35 @@ def run_defensive_market_cap_group_backtest(
                 "compensation_instruments": list(
                     defensive_config["compensation_instruments"]
                 ),
+                "risk_check_frequency": "daily_close_next_open",
             }
-            if defensive_config is not None
-            else None
+            if defensive_config is not None else None
         ),
-        "defensive_rebalance_count": defensive_rebalance_count,
+        "daily_defensive_day_count": defensive_day_count,
+        "defensive_entry_count": defensive_entry_count,
+        "defensive_exit_count": defensive_exit_count,
+        "daily_switch_count": daily_switch_count,
         "scheduled_rebalance_count": len(schedule),
-        "processed_signal_count": completed_signal_count,
         "successful_signal_count": successful_signal_count,
         "total_runtime_seconds": time.perf_counter() - started_at,
     }
-
-    # 不 print/display 以下对象；只有调用方主动索引返回值时才显示。
+    if show_progress:
+        _render_progress(
+            8, 8, "回测与审计结果整理完成", started_at,
+            completed=1, total=1,
+            detail=(
+                f"因子信号{len(rebalance_audit)}次，"
+                f"日频审计{len(defensive_audit)}日，"
+                f"成交{len(trade_audit)}条"
+            ),
+        )
+        print()
     return {
         "performance": performance,
         "schedule": schedule.copy(),
         "signals": signals,
         "rebalance_audit": rebalance_audit,
+        "defensive_audit": defensive_audit,
         "execution_audit": execution_audit,
         "order_audit": order_audit,
         "trade_audit": trade_audit,

@@ -1,22 +1,7 @@
-*
-!*/
-!.gitignore
-!*.py
-!*.ipynb
-!*.sql
-!*.sh
-!*.R
-!*.r
-!*.md
-!*.yaml
-!*.yml
-!*.toml
-!*.ini
-!*.cfg
-!*.png
-!*.jpg
-!*.jpeg
-!*.svg
-!*.webp
-__pycache__/
-*.py[cod]
+# Intentionally empty: this repository tracks all project files, including
+# trained-model bundles and their metadata. Do not add generated model formats
+# here unless those artifacts are deliberately excluded from version control.
+
+# 大型研究结果文件不提交到 GitHub
+*.csv
+*.parquet
