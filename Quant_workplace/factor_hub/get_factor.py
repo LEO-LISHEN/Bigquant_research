@@ -16,13 +16,13 @@ def get_factor(
     """
     根据因子名称调用对应的计算函数。
 
-    单一股票日频因子遵守接口：
-    ``calc_xxx(data, as_of_date=None, **params)``。
+    因子函数的 ``data`` 参数接收其 ``FACTOR`` 声明的主数据域。
+    未声明 ``primary_data_domain`` 的旧因子默认接收
+    ``security_daily``，从而保持原有选股因子兼容。
 
-    当 ``data`` 是分粒度数据容器时，旧因子仍会收到其中的
-    ``security_daily`` DataFrame；显式声明 ``domain_data`` 参数的
-    多数据域因子还会同时收到完整容器。因而旧因子无需立即改造，
-    新因子也不需要把市场数据广播到每只股票。
+    当 ``data`` 是分粒度数据容器时，显式声明 ``domain_data`` 参数的
+    多数据域因子还会同时收到完整容器。因而行业日频、市场日频和个股
+    日频数据无需相互广播。
     """
     factors = discover_factors()
 
@@ -30,13 +30,35 @@ def get_factor(
         available = ", ".join(sorted(factors)) or "暂无已登记因子"
         raise ValueError(f"未找到因子：{name}；可用因子：{available}")
 
-    factor_func = factors[name]["func"]
+    metadata = factors[name]
+    factor_func = metadata["func"]
 
-    is_data_bundle = (
-        hasattr(data, "get_security_daily")
-        and hasattr(data, "get_domain")
+    primary_data_domain = metadata.get(
+        "primary_data_domain",
+        "security_daily",
     )
-    factor_input = data.get_security_daily() if is_data_bundle else data
+    if (
+        not isinstance(primary_data_domain, str)
+        or not primary_data_domain.strip()
+    ):
+        raise ValueError(
+            f"因子 {name!r} 的 primary_data_domain 必须是非空字符串。"
+        )
+    primary_data_domain = primary_data_domain.strip()
+
+    is_data_bundle = hasattr(data, "get_domain")
+    if is_data_bundle:
+        try:
+            factor_input = data.get_domain(primary_data_domain)
+        except KeyError as exc:
+            domain_names = getattr(data, "domain_names", ())
+            raise ValueError(
+                f"因子 {name!r} 需要主数据域 "
+                f"{primary_data_domain!r}，但当前数据包仅包含："
+                f"{list(domain_names)}。"
+            ) from exc
+    else:
+        factor_input = data
 
     call_params = {"data": factor_input, **params}
     if is_data_bundle:

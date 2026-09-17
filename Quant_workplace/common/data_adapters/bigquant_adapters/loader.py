@@ -4,7 +4,7 @@
 职责：
 1. 动态读取因子的 FACTOR 元数据与本次因子参数；
 2. 根据适配器字段目录判断每个标准字段应由谁加载；
-3. 调用日频、财务、市场指数等 BigQuant 适配器；
+3. 调用个股日频、行业指数日频、财务、市场指数等 BigQuant 适配器；
 4. 只在主键粒度一致的数据之间合并；
 5. 返回 FactorDataBundle，保留各数据域原本的粒度。
 
@@ -32,6 +32,10 @@ from factor_lib.common.data_adapters.bigquant_adapters.financial import (
     ADAPTER_SPEC as FINANCIAL_ADAPTER_SPEC,
     load_financial_raw_data,
 )
+from factor_lib.common.data_adapters.bigquant_adapters.industry_daily import (
+    ADAPTER_SPEC as INDUSTRY_DAILY_ADAPTER_SPEC,
+    load_industry_daily_raw_data,
+)
 from factor_lib.common.data_adapters.bigquant_adapters.market_daily import (
     ADAPTER_SPEC as MARKET_DAILY_ADAPTER_SPEC,
     load_market_daily_raw_data,
@@ -47,6 +51,10 @@ ADAPTER_REGISTRY = {
     "financial": {
         "loader": load_financial_raw_data,
         "spec": FINANCIAL_ADAPTER_SPEC,
+    },
+    "industry_daily": {
+        "loader": load_industry_daily_raw_data,
+        "spec": INDUSTRY_DAILY_ADAPTER_SPEC,
     },
     "market_daily": {
         "loader": load_market_daily_raw_data,
@@ -863,12 +871,12 @@ def load_factor_raw_data(
                 "show_progress": show_progress,
             }
             for parameter_name in spec.get("context_parameters", ()):
-                value = resolved_params.get(parameter_name)
-                if value is None:
+                if parameter_name not in resolved_params:
                     raise ValueError(
                         f"适配器 {adapter_name!r} 需要因子参数 "
                         f"{parameter_name!r}，但本次未提供且无默认值。"
                     )
+                value = resolved_params[parameter_name]
                 call_kwargs[parameter_name] = value
 
             panel = _normalize_adapter_output(
