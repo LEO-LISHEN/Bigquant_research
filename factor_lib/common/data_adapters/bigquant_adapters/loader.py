@@ -347,15 +347,10 @@ def _legacy_declared_adapter(field_name, specification):
         return None
     data_domain = specification.get("data_domain")
     frequency = specification.get("frequency")
-    if (
-        data_domain is not None
-        and frequency is not None
-        and data_domain != frequency
-    ):
-        raise ValueError(
-            f"字段 {field_name!r} 的 data_domain 与 frequency 冲突："
-            f"{data_domain!r} != {frequency!r}。"
-        )
+
+    # data_domain 描述数据的业务粒度（如 industry_daily），frequency
+    # 描述观察频率（如 daily）；二者可以、也通常应该不同。旧因子只
+    # 声明 frequency 时，才把它作为旧式适配器名使用。
     declared = data_domain if data_domain is not None else frequency
     if declared is None:
         return None
