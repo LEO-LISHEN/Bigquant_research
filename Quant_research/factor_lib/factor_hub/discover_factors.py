@@ -19,14 +19,12 @@ def _discover_factor_records():
     if library_parent not in sys.path:
         sys.path.insert(0, library_parent)
 
-    excluded_folders = {"common", "factor_hub", "function", "__pycache__"}
+    factors_root = library_root / "factors"
     records = {}
 
-    for file_path in sorted(library_root.rglob("*.py")):
+    for file_path in sorted(factors_root.rglob("*.py")):
         relative_path = file_path.relative_to(library_root)
         if file_path.name == "__init__.py":
-            continue
-        if relative_path.parts[0] in excluded_folders:
             continue
 
         module_suffix = ".".join(relative_path.with_suffix("").parts)
