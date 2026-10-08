@@ -1,3 +1,4 @@
 {
-    "workbench.colorTheme": "BigQuant Light"
+    "workbench.colorTheme": "BigQuant Light",
+    "workbench.activityBar.location": "default"
 }
