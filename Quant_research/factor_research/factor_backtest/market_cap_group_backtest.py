@@ -1109,10 +1109,10 @@ def run_market_cap_group_backtest(
         if slippage_value < 0:
             raise ValueError("slippage_value 不能为负数。")
 
-    from factor_lib.common.data_adapters.bigquant_adapters.daily import (
+    from factor_lib.bigquant_adapters.daily import (
         load_daily_raw_data,
     )
-    from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+    from factor_lib.bigquant_adapters.loader import (
         get_factor_data_requirements,
         get_factor_metadata,
         load_factor_raw_data,

@@ -1146,8 +1146,8 @@ def run_index_enhancement_backtest(
         if costs[key] < 0:
             raise ValueError(f"trading_costs[{key!r}] 不能为负。")
 
-    from factor_lib.common.data_adapters.bigquant_adapters.daily import load_daily_raw_data
-    from factor_lib.common.data_adapters.bigquant_adapters.loader import get_factor_data_requirements, get_factor_metadata, load_factor_raw_data
+    from factor_lib.bigquant_adapters.daily import load_daily_raw_data
+    from factor_lib.bigquant_adapters.loader import get_factor_data_requirements, get_factor_metadata, load_factor_raw_data
     from factor_lib.factor_hub.get_factor import get_factor
 
     if show_progress:

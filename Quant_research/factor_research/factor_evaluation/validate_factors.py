@@ -14,7 +14,7 @@ from collections.abc import Mapping
 
 import pandas as pd
 
-from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+from factor_lib.bigquant_adapters.loader import (
     get_factor_data_requirements,
     load_factor_raw_data,
 )

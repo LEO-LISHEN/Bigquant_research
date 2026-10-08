@@ -21,22 +21,22 @@ from collections.abc import Mapping
 import numpy as np
 import pandas as pd
 
-from factor_lib.common.data_adapters.bigquant_adapters.daily import (
+from factor_lib.bigquant_adapters.daily import (
     ADAPTER_SPEC as DAILY_ADAPTER_SPEC,
     load_daily_raw_data,
 )
-from factor_lib.common.data_adapters.bigquant_adapters.factor_data_bundle import (
+from factor_lib.bigquant_adapters.factor_data_bundle import (
     FactorDataBundle,
 )
-from factor_lib.common.data_adapters.bigquant_adapters.financial import (
+from factor_lib.bigquant_adapters.financial import (
     ADAPTER_SPEC as FINANCIAL_ADAPTER_SPEC,
     load_financial_raw_data,
 )
-from factor_lib.common.data_adapters.bigquant_adapters.industry_daily import (
+from factor_lib.bigquant_adapters.industry_daily import (
     ADAPTER_SPEC as INDUSTRY_DAILY_ADAPTER_SPEC,
     load_industry_daily_raw_data,
 )
-from factor_lib.common.data_adapters.bigquant_adapters.market_daily import (
+from factor_lib.bigquant_adapters.market_daily import (
     ADAPTER_SPEC as MARKET_DAILY_ADAPTER_SPEC,
     load_market_daily_raw_data,
 )

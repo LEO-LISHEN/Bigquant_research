@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from factor_lib.common.data_adapters.bigquant_adapters.loader import (
+from factor_lib.bigquant_adapters.loader import (
     get_factor_data_requirements,
     get_factor_metadata,
     load_factor_raw_data,
