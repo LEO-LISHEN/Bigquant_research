@@ -205,7 +205,11 @@ FACTOR = {
         "progress_every": {"default": 20, "accepted_values": "正整数", "effect": "每处理多少只股票刷新一次进度。", "changes_data_requirements": False},
     },
     "data_window": {
-        "default": {"lookback_trading_days": 270, "requires_target_date_data": True, "minimum_history_observations": 13, "preheating_required": True, "insufficient_window_behavior": "缺少目标月或严格 12 个自然月前月末价格时输出 NaN，不填充。"},
+        "lookback_trading_days": 270,
+        "requires_target_date_data": True,
+        "minimum_history_observations": 13,
+        "preheating_required": True,
+        "insufficient_window_behavior": "缺少目标月或严格 12 个自然月前月末价格时输出 NaN，不填充。",
         "resolver_notes": "270 个交易日仅用于覆盖 12 个自然月预热，非公式参数。",
     },
     "output_schema": {

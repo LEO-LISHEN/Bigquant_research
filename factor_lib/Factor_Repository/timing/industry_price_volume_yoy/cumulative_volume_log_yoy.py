@@ -346,16 +346,14 @@ FACTOR = {
         },
     },
     "data_window": {
-        "default": {
-            "lookback_trading_days": 540,
-            "requires_target_date_data": True,
-            "minimum_history_observations": 24,
-            "preheating_required": True,
-            "insufficient_window_behavior": (
-                "缺少连续 24 个自然月的有效月成交量时输出 NaN，"
-                "不以零、前值或未来值补齐。"
-            ),
-        },
+        "lookback_trading_days": 540,
+        "requires_target_date_data": True,
+        "minimum_history_observations": 24,
+        "preheating_required": True,
+        "insufficient_window_behavior": (
+            "缺少连续 24 个自然月的有效月成交量时输出 NaN，"
+            "不以零、前值或未来值补齐。"
+        ),
         "resolver_notes": "540 个交易日仅用于覆盖 24 个自然月预热，非公式参数。",
     },
     "output_schema": {

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""N 月 Fama-French 三因子风格残差波动率。"""
+"""N 月 Fama-French 三因子风格残差波动率：月末稀疏数据优化版。"""
 
 from __future__ import annotations
 
@@ -9,71 +9,40 @@ import numpy as np
 import pandas as pd
 
 
-OUTPUT_COLUMNS = ["date", "instrument", "ff3_residual_volatility_nm"]
-
-
-def _build_monthly_return_panels(security_daily, domain_data, market_index, as_of_date):
-    """在本因子内部将股票及市场日频收盘价整理为月末收益率。"""
-    if domain_data is None or not hasattr(domain_data, "get_domain"):
-        raise TypeError("ff3_residual_volatility_nm 需要包含 market_daily 的 FactorDataBundle。")
-    stock = security_daily.loc[:, ["date", "instrument", "close"]].copy()
-    stock["date"] = pd.to_datetime(stock["date"], errors="coerce").dt.normalize()
-    stock["instrument"] = stock["instrument"].astype(str)
-    stock["close"] = pd.to_numeric(stock["close"], errors="coerce").where(lambda series: series > 0)
-    market = domain_data.get_domain("market_daily").copy()
-    required = {"date", "market_index", "market_close"}
-    missing = sorted(required - set(market.columns))
-    if missing:
-        raise ValueError(f"market_daily 缺少字段：{missing}。")
-    market["date"] = pd.to_datetime(market["date"], errors="coerce").dt.normalize()
-    market = market.loc[market["market_index"].astype(str) == market_index, ["date", "market_close"]].copy()
-    market["market_close"] = pd.to_numeric(market["market_close"], errors="coerce").where(lambda series: series > 0)
-    if as_of_date is not None:
-        cutoff = pd.Timestamp(as_of_date).normalize()
-        stock = stock.loc[stock["date"] <= cutoff]
-        market = market.loc[market["date"] <= cutoff]
-    if market.empty or market["date"].isna().any() or market.duplicated("date", keep=False).any():
-        raise ValueError(f"指数 {market_index!r} 的月末收益原始数据无效或不足。")
-    market = market.sort_values("date", kind="mergesort")
-    market["month"] = market["date"].dt.to_period("M")
-    month_end = market.groupby("month", sort=True, as_index=False).tail(1).sort_values("date", kind="mergesort")
-    month_end_dates = pd.DatetimeIndex(month_end["date"])
-    if len(month_end_dates) < 2:
-        raise ValueError("市场指数月末数据不足，无法构造月收益。")
-    instruments = pd.Index(stock["instrument"].unique()).sort_values()
-    stock_close = stock.pivot(index="date", columns="instrument", values="close").reindex(index=month_end_dates, columns=instruments)
-    market_close = pd.Series(month_end["market_close"].to_numpy(dtype=float), index=month_end_dates)
-    return {
-        "stock_returns": stock_close.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan),
-        "market_returns": market_close.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan),
-        "month_end_dates": month_end_dates,
-        "month_periods": pd.PeriodIndex(month_end["month"], freq="M"),
-    }
+FACTOR_NAME = "ff3_residual_volatility_nm"
+OUTPUT_COLUMNS = ["date", "instrument", FACTOR_NAME]
 
 
 def _resolve_data_window(params):
     n_months = params.get("n_months", 36)
-    trading_days_per_month = params.get("trading_days_per_month", 21)
+    days = params.get("trading_days_per_month", 21)
     if not isinstance(n_months, int) or isinstance(n_months, bool) or n_months < 1:
         raise ValueError("n_months 必须是正整数。")
-    if not isinstance(trading_days_per_month, int) or isinstance(trading_days_per_month, bool) or trading_days_per_month < 1:
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
         raise ValueError("trading_days_per_month 必须是正整数。")
     return {
-        "lookback_trading_days": (n_months + 1) * trading_days_per_month + 1,
+        "lookback_trading_days": (n_months + 1) * days + 1,
         "requires_target_date_data": True,
         "minimum_history_observations": 0,
         "preheating_required": True,
-        # 本因子只以每个自然月最后一个交易日构造月收益、SMB 和 HML；
-        # 目标日自身仍须保留，用于输出该日股票的因子值。该声明由通用
-        # SVM 自动特征读取器解释，不应由下游按因子名称编写特例。
         "input_date_sampling": "month_end_plus_target_dates",
-        "insufficient_window_behavior": (
-            "不设置人为最低观测门槛；仅在三因子回归数学上不可定义时输出NaN。"
-        ),
+        "insufficient_window_behavior": "回归数学上不可定义时输出 NaN。",
     }
 
 
-def _normalize_targets(data, target_dates, as_of_date):
+def _progress(show_progress, stage, completed, total, started_at, detail=""):
+    if not show_progress:
+        return
+    elapsed = time.perf_counter() - started_at
+    text = f"\r[{FACTOR_NAME}] [{stage}] {completed}/{total} ({completed / total:.1%}) | 已耗时 {elapsed:.1f}s"
+    if detail:
+        text += f" | {detail}"
+    if 0 < completed < total:
+        text += f" | 预计剩余 {elapsed / completed * (total - completed):.1f}s"
+    print(text.ljust(180), end="", flush=True)
+
+
+def _targets(data, target_dates, as_of_date):
     dates = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
     if dates.isna().any():
         raise ValueError("date 包含无效值。")
@@ -94,95 +63,70 @@ def _cap_weighted_return(returns, caps, mask):
     values = returns[mask]
     weights = caps[mask]
     valid = values.notna() & weights.notna() & (weights > 0)
-    if not valid.any():
-        return np.nan
-    return float(np.average(values[valid], weights=weights[valid]))
+    return float(np.average(values[valid], weights=weights[valid])) if valid.any() else np.nan
 
 
-def _build_ff3_style_returns(stock_returns, month_end_cap, month_end_pb, show_progress, progress_every, started_at):
-    """按滞后月末市值与 BP 构造 value-weighted SMB/HML。"""
+def _build_style_returns(stock_returns, caps, pb, show_progress, progress_every, started_at):
     dates = stock_returns.index
-    smb = np.full(len(dates), np.nan, dtype=float)
-    hml = np.full(len(dates), np.nan, dtype=float)
-    for position in range(1, len(dates)):
-        returns = stock_returns.iloc[position]
-        caps = month_end_cap.iloc[position - 1]
-        pb = month_end_pb.iloc[position - 1]
-        bp = 1.0 / pb.where(pb > 0)
-        valid = returns.notna() & caps.notna() & (caps > 0) & bp.notna() & (bp > 0)
+    smb = np.full(len(dates), np.nan)
+    hml = np.full(len(dates), np.nan)
+    total = max(len(dates) - 1, 1)
+    for index in range(1, len(dates)):
+        returns = stock_returns.iloc[index]
+        prior_cap = caps.iloc[index - 1]
+        bp = 1.0 / pb.iloc[index - 1].where(pb.iloc[index - 1] > 0)
+        valid = returns.notna() & prior_cap.notna() & (prior_cap > 0) & bp.notna() & (bp > 0)
         if valid.any():
-            cap_values = caps[valid]
-            bp_values = bp[valid]
-            size_cut = cap_values.median()
-            value_low = bp_values.quantile(0.30)
-            value_high = bp_values.quantile(0.70)
-            small = valid & (caps <= size_cut)
-            big = valid & (caps > size_cut)
-            low = valid & (bp <= value_low)
-            middle = valid & (bp > value_low) & (bp <= value_high)
-            high = valid & (bp > value_high)
-            portfolios = {
-                "sl": _cap_weighted_return(returns, caps, small & low),
-                "sm": _cap_weighted_return(returns, caps, small & middle),
-                "sh": _cap_weighted_return(returns, caps, small & high),
-                "bl": _cap_weighted_return(returns, caps, big & low),
-                "bm": _cap_weighted_return(returns, caps, big & middle),
-                "bh": _cap_weighted_return(returns, caps, big & high),
+            size_cut = prior_cap[valid].median()
+            low_cut = bp[valid].quantile(0.30)
+            high_cut = bp[valid].quantile(0.70)
+            small, big = valid & (prior_cap <= size_cut), valid & (prior_cap > size_cut)
+            low = valid & (bp <= low_cut)
+            middle = valid & (bp > low_cut) & (bp <= high_cut)
+            high = valid & (bp > high_cut)
+            values = {
+                "sl": _cap_weighted_return(returns, prior_cap, small & low),
+                "sm": _cap_weighted_return(returns, prior_cap, small & middle),
+                "sh": _cap_weighted_return(returns, prior_cap, small & high),
+                "bl": _cap_weighted_return(returns, prior_cap, big & low),
+                "bm": _cap_weighted_return(returns, prior_cap, big & middle),
+                "bh": _cap_weighted_return(returns, prior_cap, big & high),
             }
-            values = np.asarray(list(portfolios.values()), dtype=float)
-            if np.isfinite(values).all():
-                smb[position] = np.mean([portfolios["sl"], portfolios["sm"], portfolios["sh"]]) - np.mean([portfolios["bl"], portfolios["bm"], portfolios["bh"]])
-                hml[position] = np.mean([portfolios["sh"], portfolios["bh"]]) - np.mean([portfolios["sl"], portfolios["bl"]])
-        completed = position + 1
-        if show_progress and (completed == 2 or completed % progress_every == 0 or completed == len(dates)):
-            elapsed = time.perf_counter() - started_at
-            eta = elapsed / completed * (len(dates) - completed)
-            print(f"\r[ff3_residual_volatility_nm] [1/2] 构造 SMB/HML {completed}/{len(dates)} ({completed / len(dates):.1%}) | 当前 {dates[position]:%Y-%m-%d} | 已耗时 {elapsed:.1f}s | 预计剩余 {eta:.1f}s", end="", flush=True)
+            if np.isfinite(list(values.values())).all():
+                smb[index] = np.mean([values["sl"], values["sm"], values["sh"]]) - np.mean([values["bl"], values["bm"], values["bh"]])
+                hml[index] = np.mean([values["sh"], values["bh"]]) - np.mean([values["sl"], values["bl"]])
+        done = index
+        if done == 1 or done % progress_every == 0 or done == total:
+            _progress(show_progress, "6/7 构造 SMB/HML", done, total, started_at, f"当前 {dates[index]:%Y-%m-%d}")
     return pd.DataFrame({"smb": smb, "hml": hml}, index=dates)
 
 
-def _residual_volatility(stock_returns, factor_returns):
-    """逐股票执行含截距三因子 OLS，返回残差样本标准差。"""
+def _residual_volatility(stock_returns, factor_returns, show_progress, progress_every, started_at, target, target_position, target_total):
     y_matrix = stock_returns.to_numpy(dtype=float)
     x_matrix = factor_returns.to_numpy(dtype=float)
-    result = np.full(y_matrix.shape[1], np.nan, dtype=float)
-    for column in range(y_matrix.shape[1]):
-        y = y_matrix[:, column]
-        valid = np.isfinite(y) & np.isfinite(x_matrix).all(axis=1)
-        # 截距 + 3 个因子：至少要有一个残差自由度。
-        if int(valid.sum()) <= 4:
-            continue
-        design = np.column_stack([np.ones(int(valid.sum())), x_matrix[valid]])
-        if np.linalg.matrix_rank(design) < design.shape[1]:
-            continue
-        try:
-            coefficients = np.linalg.lstsq(design, y[valid], rcond=None)[0]
-        except np.linalg.LinAlgError:
-            continue
-        residual = y[valid] - design @ coefficients
-        if len(residual) > 1:
-            value = np.std(residual, ddof=1)
-            if np.isfinite(value):
-                result[column] = value
+    result = np.full(y_matrix.shape[1], np.nan)
+    stock_total = y_matrix.shape[1]
+    stock_step = max(250, progress_every * 50)
+    for column in range(stock_total):
+        valid = np.isfinite(y_matrix[:, column]) & np.isfinite(x_matrix).all(axis=1)
+        if valid.sum() > 4:
+            design = np.column_stack([np.ones(valid.sum()), x_matrix[valid]])
+            if np.linalg.matrix_rank(design) == design.shape[1]:
+                try:
+                    residual = y_matrix[valid, column] - design @ np.linalg.lstsq(design, y_matrix[valid, column], rcond=None)[0]
+                    result[column] = np.std(residual, ddof=1) if len(residual) > 1 else np.nan
+                except np.linalg.LinAlgError:
+                    pass
+        done = column + 1
+        if done == 1 or done % stock_step == 0 or done == stock_total:
+            _progress(show_progress, "7/7 回归残差波动率", done, stock_total, started_at, f"目标 {target_position}/{target_total}：{target:%Y-%m-%d}")
     return result
 
 
-def calc_ff3_residual_volatility_nm(
-    data,
-    target_dates=None,
-    as_of_date=None,
-    n_months=36,
-    trading_days_per_month=21,
-    market_index="csi_all_share",
-    show_progress=False,
-    progress_every=20,
-    domain_data=None,
-):
-    """计算 N 月三因子风格模型残差的样本标准差。
+def calc_ff3_residual_volatility_nm(data, target_dates=None, as_of_date=None, n_months=36, trading_days_per_month=21, market_index="csi_all_share", show_progress=False, progress_every=20, domain_data=None):
+    """计算 FF3 残差波动率。
 
-    MKT 为指定市场指数月收益；SMB/HML 在因子内部由滞后月末市值和
-    BP 的 2×3 组合构造。目标月不参与计算，月内目标日复用最近完整月
-    的估计，保证不读取尚未结束月份的收益。
+    允许输入仅包含“月末交易日 + 目标日”的稀疏面板；公式与原版一致。
     """
     _resolve_data_window({"n_months": n_months, "trading_days_per_month": trading_days_per_month})
     if not isinstance(progress_every, int) or isinstance(progress_every, bool) or progress_every < 1:
@@ -192,75 +136,94 @@ def calc_ff3_residual_volatility_nm(
     required = {"date", "instrument", "close", "total_market_cap", "pb"}
     missing = sorted(required - set(data.columns))
     if missing:
-        raise ValueError(f"ff3_residual_volatility_nm 缺少字段：{missing}。")
+        raise ValueError(f"{FACTOR_NAME} 缺少字段：{missing}。")
     if data.duplicated(["date", "instrument"], keep=False).any():
         raise ValueError("data 存在重复 date + instrument。")
+    if domain_data is None or not hasattr(domain_data, "get_domain"):
+        raise TypeError(f"{FACTOR_NAME} 需要包含 market_daily 的 FactorDataBundle。")
 
     started_at = time.perf_counter()
-    targets = _normalize_targets(data, target_dates, as_of_date)
+    targets = _targets(data, target_dates, as_of_date)
     if targets.empty:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    _progress(show_progress, "1/7 校验输入", 1, 1, started_at, f"原始 {len(data):,} 行，目标 {len(targets)} 个")
+
     source = data.loc[:, ["date", "instrument", "close", "total_market_cap", "pb"]].copy()
     source["date"] = pd.to_datetime(source["date"], errors="coerce").dt.normalize()
     source["instrument"] = source["instrument"].astype(str)
+    for column in ["close", "total_market_cap", "pb"]:
+        source[column] = pd.to_numeric(source[column], errors="coerce")
+    # 与原实现一致：无效或非正收盘价不得参与月收益计算。
+    source["close"] = source["close"].where(source["close"] > 0)
     if as_of_date is not None:
         source = source.loc[source["date"] <= pd.Timestamp(as_of_date).normalize()].copy()
-    for column in ["total_market_cap", "pb"]:
-        source[column] = pd.to_numeric(source[column], errors="coerce")
+    _progress(show_progress, "2/7 清洗并截断", 1, 1, started_at, f"保留 {len(source):,} 行")
 
-    panels = _build_monthly_return_panels(source, domain_data, market_index, as_of_date)
-    stock_returns = panels["stock_returns"]
-    market_returns = panels["market_returns"]
-    month_end_dates = panels["month_end_dates"]
-    month_periods = panels["month_periods"]
-    instruments = stock_returns.columns
-    month_end_cap = source.pivot(index="date", columns="instrument", values="total_market_cap").reindex(index=month_end_dates, columns=instruments)
-    month_end_pb = source.pivot(index="date", columns="instrument", values="pb").reindex(index=month_end_dates, columns=instruments)
-    style_returns = _build_ff3_style_returns(stock_returns, month_end_cap, month_end_pb, show_progress, int(progress_every), started_at)
-    factor_returns = pd.concat([market_returns.rename("mkt"), style_returns], axis=1)
-    target_state = source.loc[:, ["date", "instrument"]]
+    market = domain_data.get_domain("market_daily").loc[:, ["date", "market_index", "market_close"]].copy()
+    market["date"] = pd.to_datetime(market["date"], errors="coerce").dt.normalize()
+    market = market.loc[market["market_index"].astype(str) == market_index, ["date", "market_close"]]
+    market["market_close"] = pd.to_numeric(market["market_close"], errors="coerce").where(lambda x: x > 0)
+    if as_of_date is not None:
+        market = market.loc[market["date"] <= pd.Timestamp(as_of_date).normalize()]
+    if market.empty or market["date"].isna().any() or market.duplicated("date", keep=False).any():
+        raise ValueError(f"指数 {market_index!r} 的市场数据无效。")
+    market["month"] = market["date"].dt.to_period("M")
+    month_end = market.sort_values("date", kind="mergesort").groupby("month", sort=True, as_index=False).tail(1).sort_values("date", kind="mergesort")
+    month_dates = pd.DatetimeIndex(month_end["date"])
+    if len(month_dates) < 2:
+        raise ValueError("市场月末数据不足。")
+    target_state = source.loc[source["date"].isin(targets), ["date", "instrument"]].copy()
+    monthly_source = source.loc[source["date"].isin(month_dates)].copy()
+    if monthly_source.empty:
+        raise ValueError("输入缺少市场月末对应的股票数据。")
+    _progress(show_progress, "3/7 提取月末样本", 1, 1, started_at, f"月末 {len(month_dates)} 个，股票数据 {len(monthly_source):,} 行")
 
-    cached = {}
-    result_parts = []
-    total = len(targets)
+    instruments = pd.Index(monthly_source["instrument"].unique()).sort_values()
+    stock_close = monthly_source.pivot(index="date", columns="instrument", values="close").reindex(index=month_dates, columns=instruments)
+    stock_returns = stock_close.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+    del stock_close
+    _progress(show_progress, "4/7 构造月末收盘价宽表", 1, 1, started_at, f"{len(month_dates)} 月 × {len(instruments):,} 股")
+
+    month_cap = monthly_source.pivot(index="date", columns="instrument", values="total_market_cap").reindex(index=month_dates, columns=instruments)
+    month_pb = monthly_source.pivot(index="date", columns="instrument", values="pb").reindex(index=month_dates, columns=instruments)
+    market_returns = pd.Series(month_end["market_close"].to_numpy(dtype=float), index=month_dates).pct_change(fill_method=None).rename("mkt")
+    del monthly_source, source
+    _progress(show_progress, "5/7 构造月末市值与 PB 宽表", 1, 1, started_at, f"{len(month_dates)} 月 × {len(instruments):,} 股")
+
+    style_returns = _build_style_returns(stock_returns, month_cap, month_pb, show_progress, progress_every, started_at)
+    factor_returns = pd.concat([market_returns, style_returns], axis=1)
+    month_periods = pd.PeriodIndex(month_end["month"], freq="M")
+    del month_cap, month_pb, style_returns, market
+
+    cached, parts = {}, []
+    target_total = len(targets)
     try:
-        for position, target in enumerate(targets, start=1):
+        for target_position, target in enumerate(targets, start=1):
             completed_period = target.to_period("M") - 1
             end_position = month_periods.get_indexer([completed_period])[0]
-            values = np.full(len(instruments), np.nan, dtype=float)
+            values = np.full(len(instruments), np.nan)
             if end_position >= 0:
                 if end_position not in cached:
-                    start_position = max(0, end_position - int(n_months) + 1)
-                    cached[end_position] = _residual_volatility(
-                        stock_returns.iloc[start_position:end_position + 1],
-                        factor_returns.iloc[start_position:end_position + 1],
-                    )
+                    start_position = max(0, end_position - n_months + 1)
+                    cached[end_position] = _residual_volatility(stock_returns.iloc[start_position:end_position + 1], factor_returns.iloc[start_position:end_position + 1], show_progress, progress_every, started_at, target, target_position, target_total)
                 values = cached[end_position]
             target_instruments = pd.Index(target_state.loc[target_state["date"] == target, "instrument"].drop_duplicates())
-            factor = pd.Series(values, index=instruments).reindex(target_instruments)
-            result_parts.append(pd.DataFrame({"date": target, "instrument": target_instruments, "ff3_residual_volatility_nm": factor.to_numpy()}))
-            if show_progress and (position == 1 or position % progress_every == 0 or position == total):
-                elapsed = time.perf_counter() - started_at
-                eta = elapsed / position * (total - position)
-                print(f"\r[ff3_residual_volatility_nm] [2/2] 回归残差波动率 {position}/{total} ({position / total:.1%}) | 当前 {target:%Y-%m-%d} | 已耗时 {elapsed:.1f}s | 预计剩余 {eta:.1f}s", end="", flush=True)
-        return pd.concat(result_parts, ignore_index=True).sort_values(["date", "instrument"], kind="mergesort").reset_index(drop=True)
+            parts.append(pd.DataFrame({"date": target, "instrument": target_instruments, FACTOR_NAME: pd.Series(values, index=instruments).reindex(target_instruments).to_numpy()}))
+        return pd.concat(parts, ignore_index=True).sort_values(["date", "instrument"], kind="mergesort").reset_index(drop=True)
     finally:
         if show_progress:
             print()
 
 
 FACTOR = {
-    "name": "ff3_residual_volatility_nm",
+    "name": FACTOR_NAME,
     "func": calc_ff3_residual_volatility_nm,
     "factor_type": "base",
-    "candidate_instances": {
-        "36m": {"n_months": 36, "trading_days_per_month": 21, "market_index": "csi_all_share"},
-        "60m": {"n_months": 60, "trading_days_per_month": 21, "market_index": "csi_all_share"},
-    },
+    "candidate_instances": {"36m": {"n_months": 36, "trading_days_per_month": 21, "market_index": "csi_all_share"}, "60m": {"n_months": 60, "trading_days_per_month": 21, "market_index": "csi_all_share"}},
     "category": "risk",
     "direction": 0,
     "description": "个股月收益对市场、规模、价值三因子回归后的 N 月残差波动率。",
-    "formula": "std(epsilon_i)，其中 r_i = alpha + b_m*MKT + b_s*SMB + b_h*HML + epsilon_i。",
+    "formula": "std(epsilon_i)，其中 r_i=alpha+b_m*MKT+b_s*SMB+b_h*HML+epsilon_i。",
     "input_schema": {"required": {"date": {}, "instrument": {}, "close": {}, "total_market_cap": {}, "pb": {}, "market_close": {}}, "conditional": {}},
     "parameters": {
         "n_months": {"default": 36, "range": "正整数", "meaning": "最多使用的完整月收益数量，改变预热期。"},
@@ -272,9 +235,10 @@ FACTOR = {
         "progress_every": {"default": 20, "meaning": "月度风格构造和目标日循环的刷新间隔。"},
     },
     "data_window": {"resolver": _resolve_data_window, "default": _resolve_data_window({})},
-    "output_schema": {"date": {}, "instrument": {}, "ff3_residual_volatility_nm": {"dtype": "float64", "meaning": "三因子未解释收益的月度样本波动率。"}},
-    "usage_notes": "SMB/HML 使用全股票样本的滞后月末市值、BP 进行 2×3 分组，并以市值加权组合收益构造；该实现是可复现的 FF3 风格口径，未引入无风险利率。",
-    "pit_notes": "用于某月收益的市值与PB均取前一月末；月内目标日仅使用上一个完整自然月及以前数据。",
+    "output_schema": {"date": {}, "instrument": {}, FACTOR_NAME: {"dtype": "float64", "meaning": "三因子未解释收益的月度样本波动率。"}},
+    "usage_notes": "输入可稀疏到月末交易日加目标日；公式不变。",
+    "pit_notes": "SMB/HML 使用滞后月末市值和 PB；月内目标日仅使用上一个完整月及以前数据。",
+    "version": "1.1.0",
 }
 
 
