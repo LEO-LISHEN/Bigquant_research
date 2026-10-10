@@ -3,92 +3,24 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
 
-from factor_lib.bigquant_adapters.daily import (
+from factor_lib.common.data_adapters.bigquant_adapters.daily import (
     load_daily_raw_data,
 )
-from factor_lib.bigquant_adapters.loader import (
+from factor_lib.common.data_adapters.bigquant_adapters.loader import (
     get_factor_data_requirements,
     get_factor_metadata,
     load_factor_raw_data,
 )
+from factor_lib.common.preprocess.zscore import zscore
 from factor_lib.factor_hub.get_factor import get_factor
-
-
-# 本因子专用的预处理实现；保留旧数值规则和处理顺序。
-def _zscore(
-    series,
-    ddof=0,
-    show_progress=False,
-):
-    """对单个截面执行 Z-score 标准化。
-
-    参数
-    ----
-    series : pandas.Series
-        待标准化的截面数据。
-    ddof : int，默认 0
-        标准差的自由度。0 为总体标准差；1 为样本标准差。
-        保留默认值 0，以兼容因子库中已有调用。
-    show_progress : bool，默认 False
-        是否显示一行处理状态；嵌套调用时应保持 False。
-
-    返回
-    ----
-    pandas.Series
-        与输入索引一致的标准化结果。有效样本不足或无波动时返回 NaN。
-    """
-    if not isinstance(series, pd.Series):
-        raise TypeError("series 必须是 pandas.Series。")
-    if (
-        not isinstance(ddof, (int, np.integer))
-        or isinstance(ddof, (bool, np.bool_))
-        or int(ddof) < 0
-    ):
-        raise ValueError("ddof 必须是非负整数。")
-    if not isinstance(show_progress, (bool, np.bool_)):
-        raise TypeError("show_progress 必须是 bool。")
-
-    ddof = int(ddof)
-    values = pd.to_numeric(series, errors="coerce").astype(float)
-    finite = np.isfinite(values)
-    result = pd.Series(
-        np.nan,
-        index=series.index,
-        name=series.name,
-        dtype=float,
-    )
-
-    if show_progress:
-        print(
-            "\r[Z-score] 正在执行截面标准化...",
-            end="",
-            flush=True,
-        )
-
-    try:
-        valid = values.loc[finite]
-        if len(valid) <= ddof:
-            return result
-
-        std = valid.std(ddof=ddof)
-        if not np.isfinite(std) or std <= 0:
-            return result
-
-        result.loc[finite] = (
-            valid - valid.mean()
-        ) / std
-        return result
-    finally:
-        if show_progress:
-            print(
-                "\r[Z-score] 截面标准化完成。      "
-            )
 
 
 _RESERVED_FACTOR_PARAMS = {
@@ -120,6 +52,43 @@ def _normalize_positive_integer(value, parameter_name):
     ):
         raise ValueError(f"{parameter_name} 必须是正整数。")
     return int(value)
+
+
+def _normalize_hac_lags(value):
+    """标准化 Newey-West 最大滞后阶数；None 表示自动选择。"""
+    if value is None:
+        return None
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or int(value) < 0
+    ):
+        raise ValueError("hac_lags 必须是非负整数或 None。")
+    return int(value)
+
+
+def _normalize_significance_level(value):
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not np.isfinite(value)
+        or not 0.0 < float(value) < 1.0
+    ):
+        raise ValueError("significance_level 必须是介于 0 和 1 之间的数值。")
+    return float(value)
+
+
+def _normalize_optional_positive_float(value, parameter_name):
+    if value is None:
+        return None
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not np.isfinite(value)
+        or float(value) <= 0.0
+    ):
+        raise ValueError(f"{parameter_name} 必须是正数或 None。")
+    return float(value)
 
 
 def _normalize_factor_params(factor_params):
@@ -593,11 +562,115 @@ def _prepare_forward_return_labels(
     return label_data
 
 
+def _calculate_newey_west_mean_statistics(values, hac_lags):
+    """计算一维序列均值的 Bartlett 核 Newey-West/HAC 标准误。"""
+    series = pd.to_numeric(
+        pd.Series(values), errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    observation_count = len(series)
+    mean_value = series.mean() if observation_count else np.nan
+
+    if observation_count < 2:
+        return {
+            "mean": mean_value,
+            "observation_count": observation_count,
+            "hac_lags": 0,
+            "standard_error": np.nan,
+            "t_value": np.nan,
+        }
+
+    if hac_lags is None:
+        # Newey-West (1994) 常用的样本量规则；使用者可显式覆盖。
+        resolved_lags = int(
+            np.floor(4.0 * (observation_count / 100.0) ** (2.0 / 9.0))
+        )
+    else:
+        resolved_lags = hac_lags
+    resolved_lags = min(resolved_lags, observation_count - 1)
+
+    centered = series.to_numpy(dtype=float) - float(mean_value)
+    long_run_variance = float(np.dot(centered, centered) / observation_count)
+
+    for lag in range(1, resolved_lags + 1):
+        autocovariance = float(
+            np.dot(centered[lag:], centered[:-lag]) / observation_count
+        )
+        bartlett_weight = 1.0 - lag / (resolved_lags + 1.0)
+        long_run_variance += 2.0 * bartlett_weight * autocovariance
+
+    # Bartlett 权重下理论上半正定；仅容忍浮点运算产生的极小负数。
+    if long_run_variance < 0.0 and np.isclose(
+        long_run_variance, 0.0, atol=1e-15
+    ):
+        long_run_variance = 0.0
+
+    if not np.isfinite(long_run_variance) or long_run_variance <= 0.0:
+        standard_error = np.nan
+        t_value = np.nan
+    else:
+        standard_error = float(
+            np.sqrt(long_run_variance / observation_count)
+        )
+        t_value = float(mean_value / standard_error)
+
+    return {
+        "mean": mean_value,
+        "observation_count": observation_count,
+        "hac_lags": resolved_lags,
+        "standard_error": standard_error,
+        "t_value": t_value,
+    }
+
+
+def _classify_fama_macbeth_significance(
+    t_value,
+    significance_level,
+    abs_t_threshold,
+):
+    """按双侧阈值对 Fama-MacBeth/HAC t 值分类。"""
+    if not np.isfinite(t_value):
+        return {
+            "p_value": np.nan,
+            "critical_t_value": np.nan,
+            "threshold_rule": "unavailable",
+            "significance": "unavailable",
+        }
+
+    if abs_t_threshold is None:
+        critical_t_value = float(
+            NormalDist().inv_cdf(1.0 - significance_level / 2.0)
+        )
+        threshold_rule = (
+            f"two_sided_normal_alpha_{significance_level:g}"
+        )
+    else:
+        critical_t_value = abs_t_threshold
+        threshold_rule = "user_supplied_abs_t_threshold"
+
+    p_value = float(math.erfc(abs(float(t_value)) / math.sqrt(2.0)))
+    if abs(float(t_value)) < critical_t_value:
+        significance = "not_significant"
+    elif t_value > 0.0:
+        significance = "positive_significant"
+    else:
+        significance = "negative_significant"
+
+    return {
+        "p_value": p_value,
+        "critical_t_value": critical_t_value,
+        "threshold_rule": threshold_rule,
+        "significance": significance,
+    }
+
+
 def _calculate_metrics_from_panels(
     factor_data,
     label_data,
     factor_column,
     min_obs,
+    hac_lags,
+    significance_level,
+    fmb_abs_t_threshold,
     show_progress,
     progress_every,
     started_at,
@@ -681,7 +754,6 @@ def _calculate_metrics_from_panels(
         ic = np.nan
         rank_ic = np.nan
         factor_return = np.nan
-        factor_t_value = np.nan
 
         if sample_count >= min_obs:
             ic = valid[factor_column].corr(
@@ -695,7 +767,7 @@ def _calculate_metrics_from_panels(
 
             regression_data = pd.DataFrame(
                 {
-                    "factor": _zscore(valid[factor_column]),
+                    "factor": zscore(valid[factor_column]),
                     "return": valid["forward_return"],
                 }
             ).dropna()
@@ -719,30 +791,7 @@ def _calculate_metrics_from_panels(
                         y,
                         rcond=None,
                     )[0]
-                    residual = y - x @ beta
-                    degrees_of_freedom = len(y) - 2
-
-                    if degrees_of_freedom > 0:
-                        residual_variance = (
-                            np.sum(residual ** 2)
-                            / degrees_of_freedom
-                        )
-                        covariance = (
-                            residual_variance
-                            * np.linalg.inv(x.T @ x)
-                        )
-                        standard_error = np.sqrt(
-                            covariance[1, 1]
-                        )
-                        factor_return = beta[1]
-
-                        if (
-                            standard_error > 0
-                            and np.isfinite(standard_error)
-                        ):
-                            factor_t_value = (
-                                beta[1] / standard_error
-                            )
+                    factor_return = beta[1]
 
         records.append(
             {
@@ -752,7 +801,6 @@ def _calculate_metrics_from_panels(
                 "ic": ic,
                 "rank_ic": rank_ic,
                 "factor_return": factor_return,
-                "factor_t_value": factor_t_value,
             }
         )
 
@@ -782,12 +830,20 @@ def _calculate_metrics_from_panels(
             "ic",
             "rank_ic",
             "factor_return",
-            "factor_t_value",
         ],
     )
 
     ic_std = timeseries["ic"].std(ddof=1)
     rank_ic_std = timeseries["rank_ic"].std(ddof=1)
+    factor_return_hac = _calculate_newey_west_mean_statistics(
+        values=timeseries["factor_return"],
+        hac_lags=hac_lags,
+    )
+    fmb_inference = _classify_fama_macbeth_significance(
+        t_value=factor_return_hac["t_value"],
+        significance_level=significance_level,
+        abs_t_threshold=fmb_abs_t_threshold,
+    )
     summary = pd.DataFrame(
         [
             {
@@ -805,12 +861,27 @@ def _calculate_metrics_from_panels(
                     and rank_ic_std != 0
                     else np.nan
                 ),
-                "factor_return_mean": timeseries[
-                    "factor_return"
-                ].mean(),
-                "mean_t_value": timeseries[
-                    "factor_t_value"
-                ].mean(),
+                "factor_return_mean": factor_return_hac["mean"],
+                "factor_return_hac_standard_error": factor_return_hac[
+                    "standard_error"
+                ],
+                "factor_return_hac_t_value": factor_return_hac[
+                    "t_value"
+                ],
+                "factor_return_hac_p_value": fmb_inference["p_value"],
+                "factor_return_hac_critical_t_value": fmb_inference[
+                    "critical_t_value"
+                ],
+                "factor_return_hac_threshold_rule": fmb_inference[
+                    "threshold_rule"
+                ],
+                "factor_return_hac_significance": fmb_inference[
+                    "significance"
+                ],
+                "factor_return_hac_lags": factor_return_hac["hac_lags"],
+                "factor_return_valid_count": factor_return_hac[
+                    "observation_count"
+                ],
                 "cross_section_count": len(timeseries),
                 "valid_ic_count": timeseries[
                     "ic"
@@ -901,6 +972,9 @@ def calculate_factor_basic_metrics(
     instruments=None,
     universe=None,
     min_obs=30,
+    hac_lags=None,
+    significance_level=0.05,
+    fmb_abs_t_threshold=None,
     plot=True,
     plot_title=None,
     figsize=(14, 5),
@@ -930,6 +1004,20 @@ def calculate_factor_basic_metrics(
         instruments。固定股票池仍可通过 instruments 保持原调用方式。
     min_obs : int
         单个截面计算指标所需的最少完整股票数。
+    hac_lags : int 或 None
+        因子收益均值 Newey-West/HAC 标准误的最大滞后阶数。None 时按
+        ``floor(4 * (有效截面数 / 100) ** (2 / 9))`` 自动选择，并限制在
+        有效截面数减一以内。此调整用于跨截面的 factor_return 时间序列；
+        不用于单个截面 OLS 的 factor_t_value。
+    significance_level : float，默认 0.05
+        当未指定 ``fmb_abs_t_threshold`` 时，Fama-MacBeth/HAC 均值检验的
+        双侧显著性水平。默认临界值约为 |t| >= 1.96，适用于预先指定的
+        单因子检验。
+    fmb_abs_t_threshold : float 或 None
+        可选的 Fama-MacBeth/HAC 显著性绝对 t 值阈值。None 时使用由
+        ``significance_level`` 推导的双侧正态临界值。多个候选因子被反复
+        挖掘或筛选时，应预先声明更严格阈值（例如 3）或使用独立的多重检验
+        校正；本函数不会把探索性多因子结果自动包装为确认性结论。
     plot : bool
         是否绘制并展示 IC/RankIC 时序图。
 
@@ -963,6 +1051,14 @@ def calculate_factor_basic_metrics(
     min_obs = _normalize_positive_integer(
         min_obs,
         "min_obs",
+    )
+    hac_lags = _normalize_hac_lags(hac_lags)
+    significance_level = _normalize_significance_level(
+        significance_level
+    )
+    fmb_abs_t_threshold = _normalize_optional_positive_float(
+        fmb_abs_t_threshold,
+        "fmb_abs_t_threshold",
     )
     progress_every = _normalize_positive_integer(
         progress_every,
@@ -1105,6 +1201,9 @@ def calculate_factor_basic_metrics(
             label_data=label_data,
             factor_column=factor_column,
             min_obs=min_obs,
+            hac_lags=hac_lags,
+            significance_level=significance_level,
+            fmb_abs_t_threshold=fmb_abs_t_threshold,
             show_progress=show_progress,
             progress_every=progress_every,
             started_at=started_at,
